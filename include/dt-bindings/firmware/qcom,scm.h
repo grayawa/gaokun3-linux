@@ -36,5 +36,6 @@
 #define QCOM_SCM_VMID_TVM		0x2D
 #define QCOM_SCM_VMID_OEMVM		0x31
 #define QCOM_SCM_VMID_CP_ADSP_SHARED	0x33
+#define QCOM_SCM_VMID_SELF_OWNER 0xffffffff
 
 #endif
