@@ -396,7 +396,7 @@ static void pmic_glink_remove(struct platform_device *pdev)
 		pmic_glink_del_aux_device(pg, &pg->ucsi_aux);
 
 	unregister_rpmsg_driver(&pmic_glink_rpmsg_driver);
-	
+
 	guard(mutex)(&__pmic_glink_lock);
 	__pmic_glink = NULL;
 }
