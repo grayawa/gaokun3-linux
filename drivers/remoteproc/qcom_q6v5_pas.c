@@ -455,13 +455,6 @@ static int qcom_pas_stop(struct rproc *rproc)
 	return ret;
 }
 
-static int qcom_pas_attach(struct rproc *rproc)
-{
-	struct qcom_pas *pas = rproc->priv;
-
-	return qcom_q6v5_attach(&pas->q6v5);
-}
-
 static void *qcom_pas_da_to_va(struct rproc *rproc, u64 da, size_t len, bool *is_iomem)
 {
 	struct qcom_pas *pas = rproc->priv;
@@ -609,7 +602,6 @@ static const struct rproc_ops qcom_pas_ops = {
 	.parse_fw = qcom_pas_parse_firmware,
 	.load = qcom_pas_load,
 	.panic = qcom_pas_panic,
-	.attach = qcom_pas_attach,
 };
 
 static const struct rproc_ops qcom_pas_minidump_ops = {
@@ -622,7 +614,6 @@ static const struct rproc_ops qcom_pas_minidump_ops = {
 	.load = qcom_pas_load,
 	.panic = qcom_pas_panic,
 	.coredump = qcom_pas_minidump,
-	.attach = qcom_pas_attach,
 };
 
 static const struct rproc_ops qcom_pas_ops_no_reset = {
