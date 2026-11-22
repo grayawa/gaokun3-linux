@@ -1,14 +1,14 @@
 # Linux 7.2.15-bore source-priority port
 
 Pinned source: https://github.com/gaokun3/kernel/tree/7.2.15-bore
-Source commit: 
-Destination base: 
-Synthetic common base: Linux .
+Source commit: `206f40c6879ad336544e3dbb1131b34cd355097f`
+Destination base: `5e6ebcd9c05bd87110f0a0c17e47e63a85f49007`
+Synthetic common base: Linux `v7.2.14`.
 
 ## Merge policy
 
 This candidate prefers the complete upstream 7.2.15-bore implementation for
-overlapping hunks (, with upstream as the first side).
+overlapping hunks (`git merge-tree -X ours`, with upstream as the first side).
 Non-overlapping local changes are retained. This avoids the mixed-version
 UCSI and battery implementations produced by the earlier local-priority draft.
 
