@@ -1,0 +1,98 @@
+name: gaokun3 Linux 7.2.15-bore source-first smoke build
+on:
+  push:
+    branches:
+      - automation/port-7.2.15-bore-source-first
+    paths:
+      - scripts/port-7.2.15-bore-source-first.sh
+      - .github/workflows/port-7.2.15-bore-source-first.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-7.2.15-bore-source-first
+  cancel-in-progress: true
+
+jobs:
+  port:
+    name: Generate source-priority candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      REPORT_DIR: port-report
+    steps:
+      - name: Check out port tooling
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/port-7.2.15-bore-source-first.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: true
+
+      - name: Check Git merge-tree support
+        run: |
+          set -euo pipefail
+          git --version
+          help_text="$(git merge-tree -h 2>&1 || true)"
+          grep -q 'merge-base' <<< "$help_text"
+
+      - name: Generate review branch
+        run: bash scripts/port-7.2.15-bore-source-first.sh
+
+      - name: Save port report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaokun3-7.2.15-bore-source-first-report
+          path: port-report/
+          if-no-files-found: ignore
+
+  arm64-smoke:
+    name: ARM64 Image + DTB + modules
+    needs: port
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: port/7.2.15-bore-source-first
+          fetch-depth: 1
+
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev clang llvm lld \
+            device-tree-compiler
+
+      - name: Generate gaokun3 config and check requested features
+        shell: bash
+        run: |
+          set -euo pipefail
+          make O=build ARCH=arm64 LLVM=1 gaokun3_defconfig
+          for option in SCHED_BORE KVM KPROBES FTRACE KPROBE_EVENTS TRACING TRACEFS_FS; do
+            grep -qx "CONFIG_${option}=y" build/.config
+          done
+          grep -qx 'CONFIG_QCOM_FASTRPC=m' build/.config
+          grep -qx 'CONFIG_VIDEO_OV13B10=m' build/.config
+
+      - name: Compile Image, DTBs and modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          make O=build ARCH=arm64 LLVM=1 -j4 Image dtbs modules 2>&1 | tee arm64-build.log
+
+      - name: Upload build outputs and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaokun3-7.2.15-bore-source-first-build
+          path: |
+            arm64-build.log
+            build/arch/arm64/boot/Image
+            build/arch/arm64/boot/dts/qcom/sc8280xp-huawei-gaokun3.dtb
+            build/Module.symvers
+          if-no-files-found: ignore
