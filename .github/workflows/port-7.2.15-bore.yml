@@ -28,7 +28,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          filter: blob:none
           sparse-checkout: |
             scripts/port-7.2.15-bore.sh
           sparse-checkout-cone-mode: false
