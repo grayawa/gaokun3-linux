@@ -1,0 +1,49 @@
+name: Port Linux 7.2.15-bore onto gaokun3
+on:
+  push:
+    branches:
+      - automation/port-7.2.15-bore
+    paths:
+      - scripts/port-7.2.15-bore.sh
+      - .github/workflows/port-7.2.15-bore.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-7.2.15-bore-port
+  cancel-in-progress: false
+
+jobs:
+  port:
+    name: Three-way merge against Linux 7.2.14
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PUSH_PORT_BRANCH: "true"
+      REPORT_DIR: port-report
+    steps:
+      - name: Check out port tooling
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          persist-credentials: true
+
+      - name: Check toolchain
+        run: |
+          set -euo pipefail
+          git --version
+          git merge-tree -h 2>&1 | grep -q -- '--merge-base'
+
+      - name: Generate review branch from 7.2.15-bore
+        run: bash scripts/port-7.2.15-bore.sh
+
+      - name: Save port and conflict reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaokun3-7.2.15-bore-port-report
+          path: port-report/
+          if-no-files-found: ignore
