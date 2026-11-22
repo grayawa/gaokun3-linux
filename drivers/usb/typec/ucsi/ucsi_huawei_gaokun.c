@@ -20,7 +20,7 @@
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
-#include <linux/workqueue.h>
+#include <linux/workqueue_types.h>
 
 #include "ucsi.h"
 
@@ -84,10 +84,6 @@ struct gaokun_ucsi_reg {
 	u8 reserved;
 } __packed;
 
-#define GAOKUN_UCSI_BYTES_PER_PORT	2
-#define GAOKUN_UCSI_MAX_PORTS \
-	(sizeof_field(struct gaokun_ucsi_reg, port_data) / GAOKUN_UCSI_BYTES_PER_PORT)
-
 struct gaokun_ucsi_port {
 	struct delayed_work usb_work;
 	spinlock_t lock; /* serializing port resource access */
@@ -106,7 +102,6 @@ struct gaokun_ucsi_port {
 	u16 svid;
 	u8 hpd_state;
 	u8 hpd_irq;
-	bool hpd_reported; /* last HPD state sent to the DP bridge */
 };
 
 struct gaokun_ucsi {
@@ -183,66 +178,6 @@ static int gaokun_ucsi_async_control(struct ucsi *ucsi, u64 command)
 	return gaokun_ec_ucsi_write(uec->ec, buf);
 }
 
-/*
- * When the connector changes again while GET_CONNECTOR_STATUS for it is
- * pending, the EC sometimes gives the command up: it reports the change
- * instead of completing the command, or sets BUSY and keeps it set. It
- * does take the next command, so send this one again; it only reads state.
- * gaokun_ucsi_notify() ends the wait when it sees either.
- *
- * This relies on what the EC was seen to do. BUSY is a legal state, so a slow
- * command looks like a dropped one at first: the CCI is read again 200 ms
- * later, and a completion that arrived meanwhile is taken as the result. The
- * command is then sent again without a CANCEL first: a dropped command was
- * never seen to complete later, the resent one completed within 50 ms, and
- * how the EC handles CANCEL was not tried. Should a dropped command complete
- * after all, its COMMAND_COMPLETE could end the wait for the next command
- * early, and that command would read the wrong MESSAGE_IN.
- */
-static int gaokun_ucsi_sync_control(struct ucsi *ucsi, u64 command, u32 *cci,
-				    void *data, size_t size, void *msg_out,
-				    size_t msg_out_size)
-{
-	struct gaokun_ucsi *uec = ucsi_get_drvdata(ucsi);
-	int tries = GAOKUN_UCSI_CMD_TRIES;
-	u32 status;
-	int ret;
-
-	if (UCSI_COMMAND(command) != UCSI_GET_CONNECTOR_STATUS)
-		return ucsi_sync_control_common(ucsi, command, cci, data, size,
-						msg_out, msg_out_size);
-
-	for (;;) {
-		if (cci)
-			*cci = 0;
-		WRITE_ONCE(uec->cmd_lost, false);
-		WRITE_ONCE(uec->resend_cmd, command);
-		ret = ucsi_sync_control_common(ucsi, command, cci, data, size,
-					       msg_out, msg_out_size);
-		WRITE_ONCE(uec->resend_cmd, 0);
-		if (!READ_ONCE(uec->cmd_lost))
-			return ret;
-
-		msleep(GAOKUN_UCSI_CMD_RETRY_MS);
-
-		/* The EC may have completed the command after all */
-		ret = gaokun_ucsi_read_cci(ucsi, &status);
-		if (ret)
-			return ret;
-		if (status & UCSI_CCI_COMMAND_COMPLETE || !--tries)
-			break;
-
-		dev_dbg(uec->dev, "resending command %#llx\n", command);
-	}
-
-	/* Without COMMAND_COMPLETE, UCSI fails the command, or cancels it */
-	if (cci)
-		*cci = status;
-	if (data && status & UCSI_CCI_COMMAND_COMPLETE)
-		ret = gaokun_ucsi_read_message_in(ucsi, data, size);
-	return ret;
-}
-
 static void gaokun_ucsi_update_connector(struct ucsi_connector *con)
 {
 	struct gaokun_ucsi *uec = ucsi_get_drvdata(con->ucsi);
@@ -256,7 +191,6 @@ static void gaokun_ucsi_update_connector(struct ucsi_connector *con)
 static int gaokun_set_orientation(struct ucsi_connector *con,
 				  struct gaokun_ucsi_port *port)
 {
-	enum typec_orientation orientation;
 	enum gaokun_ucsi_ccx ccx;
 	unsigned long flags;
 
@@ -288,7 +222,7 @@ static const struct ucsi_operations gaokun_ucsi_ops = {
 	.read_cci = gaokun_ucsi_read_cci,
 	.poll_cci = gaokun_ucsi_read_cci,
 	.read_message_in = gaokun_ucsi_read_message_in,
-	.sync_control = gaokun_ucsi_sync_control,
+	.sync_control = ucsi_sync_control_common,
 	.async_control = gaokun_ucsi_async_control,
 	.update_connector = gaokun_ucsi_update_connector,
 	.connector_status = gaokun_ucsi_connector_status,
@@ -768,9 +702,7 @@ static bool gaokun_ucsi_should_handle_usb_event(struct gaokun_ucsi *uec)
 /*
  * USB event is necessary for enabling altmode, the event should follow
  * UCSI event, if not after timeout(this notify may be disabled somehow),
- * then force to enable altmode. When inserting, 2 UCSI events (connector
- * change) are followed by USB events. Once we have received one USB event,
- * USB events are not blocked, and the fallback is no longer needed.
+ * then force to enable altmode.
  */
 static void gaokun_ucsi_handle_no_usb_event(struct work_struct *work)
 {
@@ -863,7 +795,6 @@ static int gaokun_ucsi_ports_init(struct gaokun_ucsi *uec)
 				  GFP_KERNEL);
 	if (!uec->ports)
 		return -ENOMEM;
-	uec->num_ports = num_ports;
 
 	for (i = 0; i < num_ports; ++i) {
 		ucsi_port = &uec->ports[i];
