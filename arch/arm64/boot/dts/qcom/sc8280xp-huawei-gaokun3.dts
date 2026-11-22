@@ -2056,6 +2056,36 @@
 		};
 	};
 
+	spi20_default: spi20-default-state {
+		miso-pins {
+			pins = "gpio87";
+			function = "qup20";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+
+		mosi-pins {
+			pins = "gpio88";
+			function = "qup20";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+
+		clk-pins {
+			pins = "gpio89";
+			function = "qup20";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+
+		cs-pins {
+			pins = "gpio90";
+			function = "qup20";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+	};
+
 	spi6_default: spi6-default-state {
 		miso-n-pins {
 			pins = "gpio154";
@@ -2099,6 +2129,15 @@
 
 		reset-n-pins {
 			pins = "gpio99";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+		};
+	};
+
+	ts1_default: ts1-default-state {
+		int-n-pins {
+			pins = "gpio39";
 			function = "gpio";
 			drive-strength = <2>;
 			bias-disable;

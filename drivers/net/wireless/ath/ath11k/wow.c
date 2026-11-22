@@ -786,7 +786,6 @@ int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
 	ret = ath11k_wow_enable(ar->ab);
 	if (ret) {
 		ath11k_warn(ar->ab, "failed to start wow: %d\n", ret);
-		declined = ret == -EBUSY;
 		goto cleanup;
 	}
 
