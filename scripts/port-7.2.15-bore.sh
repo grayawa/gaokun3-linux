@@ -43,11 +43,11 @@ BASE_SHA="$(git rev-parse "refs/tags/port-base-$STABLE_TAG^{commit}")"
 printf 'dest=%s\nupstream=%s\nmerge_base=%s\n' \
   "$DEST_SHA" "$SOURCE_SHA" "$BASE_SHA" > "$REPORT_DIR/refs.txt"
 
-git show "$DEST_SHA:Makefile" | grep -qx 'SUBLEVEL = 14' \
+grep -qx 'SUBLEVEL = 14' <(git show "$DEST_SHA:Makefile") \
   || die "Destination no longer reports Linux 7.2.14"
-git show "$SOURCE_SHA:Makefile" | grep -qx 'SUBLEVEL = 15' \
+grep -qx 'SUBLEVEL = 15' <(git show "$SOURCE_SHA:Makefile") \
   || die "Source no longer reports Linux 7.2.15"
-git show "$BASE_SHA:Makefile" | grep -qx 'SUBLEVEL = 14' \
+grep -qx 'SUBLEVEL = 14' <(git show "$BASE_SHA:Makefile") \
   || die "Incorrect synthetic merge base"
 
 say "Three-way merge using the exact Linux $STABLE_TAG release as base"
@@ -106,15 +106,15 @@ fi
 
 # Reject an apparently successful merge if it dropped critical functionality.
 say "Validate critical source and device features"
-git show "$MERGED_TREE:Makefile" | grep -qx 'SUBLEVEL = 15' \
+grep -qx 'SUBLEVEL = 15' <(git show "$MERGED_TREE:Makefile") \
   || die "Merged tree is not Linux 7.2.15"
-git show "$MERGED_TREE:init/Kconfig" | grep -q '^config SCHED_BORE$' \
+grep -q '^config SCHED_BORE$' <(git show "$MERGED_TREE:init/Kconfig") \
   || die "BORE Kconfig entry missing"
-git show "$MERGED_TREE:kernel/sched/fair.c" | grep -q 'CONFIG_SCHED_BORE' \
+grep -q 'CONFIG_SCHED_BORE' <(git show "$MERGED_TREE:kernel/sched/fair.c") \
   || die "BORE scheduler integration missing"
-git show "$MERGED_TREE:arch/arm64/configs/gaokun3_defconfig" | grep -qx 'CONFIG_KVM=y' \
+grep -qx 'CONFIG_KVM=y' <(git show "$MERGED_TREE:arch/arm64/configs/gaokun3_defconfig") \
   || die "KVM disabled in device defconfig"
-git show "$MERGED_TREE:arch/arm64/configs/gaokun3_defconfig" | grep -qx 'CONFIG_QCOM_FASTRPC=m' \
+grep -qx 'CONFIG_QCOM_FASTRPC=m' <(git show "$MERGED_TREE:arch/arm64/configs/gaokun3_defconfig") \
   || die "FastRPC module disabled in device defconfig"
 git cat-file -e "$MERGED_TREE:arch/arm64/boot/dts/qcom/sc8280xp-huawei-gaokun3.dts" \
   || die "gaokun3 DT missing"
