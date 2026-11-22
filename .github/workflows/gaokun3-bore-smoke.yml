@@ -1,0 +1,48 @@
+name: gaokun3 Linux 7.2.15-bore smoke build
+on:
+  push:
+    branches:
+      - port/7.2.15-bore
+
+permissions:
+  contents: read
+
+jobs:
+  arm64-smoke:
+    name: ARM64 kernel image + gaokun3 DTB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev clang llvm lld \
+            device-tree-compiler
+
+      - name: Generate gaokun3 config and check features
+        shell: bash
+        run: |
+          set -euo pipefail
+          make O=build ARCH=arm64 LLVM=1 gaokun3_defconfig
+          grep -qx 'CONFIG_SCHED_BORE=y' build/.config
+          grep -qx 'CONFIG_KVM=y' build/.config
+          grep -qx 'CONFIG_QCOM_FASTRPC=m' build/.config
+
+      - name: Compile Image and device trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          make O=build ARCH=arm64 LLVM=1 -j4 Image dtbs 2>&1 | tee arm64-build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaokun3-bore-build-log
+          path: arm64-build.log
+          if-no-files-found: ignore
