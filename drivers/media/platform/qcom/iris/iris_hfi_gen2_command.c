@@ -247,8 +247,10 @@ static int iris_hfi_gen2_set_crop_offsets(struct iris_inst *inst, u32 plane)
 	} else {
 		codec_align = inst->codec == V4L2_PIX_FMT_HEVC ? 32 : 16;
 		if (V4L2_TYPE_IS_OUTPUT(plane)) {
-			bottom_offset = (inst->enc_raw_height - inst->crop.height);
-			right_offset = (inst->enc_raw_width - inst->crop.width);
+			bottom_offset = inst->enc_raw_height -
+				min(inst->crop.height, inst->enc_raw_height);
+			right_offset = inst->enc_raw_width -
+				min(inst->crop.width, inst->enc_raw_width);
 			left_offset = inst->crop.left;
 			top_offset = inst->crop.top;
 		} else {
@@ -666,6 +668,23 @@ static int iris_hfi_gen2_set_super_block(struct iris_inst *inst, u32 plane)
 						  sizeof(u32));
 }
 
+static int iris_hfi_gen2_set_decode_order_output(struct iris_inst *inst, u32 plane)
+{
+	struct platform_inst_fw_cap *cap = &inst->fw_caps[DISPLAY_DELAY_ENABLE];
+	u32 decode_order = cap->value;
+
+	/* Leave the firmware default unchanged unless userspace sets the control. */
+	if (!(cap->flags & CAP_FLAG_CLIENT_SET))
+		return 0;
+
+	return iris_hfi_gen2_session_set_property(inst,
+						  HFI_PROP_DECODE_ORDER_OUTPUT,
+						  HFI_HOST_FLAGS_NONE,
+						  HFI_PORT_BITSTREAM,
+						  HFI_PAYLOAD_U32,
+						  &decode_order, sizeof(decode_order));
+}
+
 static int iris_hfi_gen2_session_set_config_params(struct iris_inst *inst, u32 plane)
 {
 	const struct iris_firmware_data *fdata = inst->core->iris_firmware_data;
@@ -692,6 +711,7 @@ static int iris_hfi_gen2_session_set_config_params(struct iris_inst *inst, u32 p
 		{HFI_PROP_FRAME_RATE,                 iris_hfi_gen2_set_frame_rate             },
 		{HFI_PROP_AV1_FILM_GRAIN_PRESENT,     iris_hfi_gen2_set_film_grain             },
 		{HFI_PROP_AV1_SUPER_BLOCK_ENABLED,    iris_hfi_gen2_set_super_block            },
+		{HFI_PROP_DECODE_ORDER_OUTPUT,        iris_hfi_gen2_set_decode_order_output    },
 	};
 
 	if (inst->domain == DECODER) {
@@ -1219,6 +1239,8 @@ static int iris_hfi_gen2_session_drain(struct iris_inst *inst, u32 plane)
 
 	if (!V4L2_TYPE_IS_OUTPUT(plane))
 		return 0;
+	if (!inst_hfi_gen2->packet)
+		return -EINVAL;
 
 	iris_hfi_gen2_packet_session_command(inst,
 					     HFI_CMD_DRAIN,

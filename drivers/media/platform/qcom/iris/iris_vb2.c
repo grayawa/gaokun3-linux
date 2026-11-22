@@ -234,6 +234,7 @@ void iris_vb2_stop_streaming(struct vb2_queue *q)
 	int ret = 0;
 
 	inst = vb2_get_drv_priv(q);
+	iris_wait_for_sys_error(inst->core);
 
 	if (V4L2_TYPE_IS_CAPTURE(q->type) && inst->state == IRIS_INST_INIT)
 		return;
@@ -245,8 +246,12 @@ void iris_vb2_stop_streaming(struct vb2_queue *q)
 		goto exit;
 
 	ret = iris_session_streamoff(inst, q->type);
-	if (ret)
+	if (ret) {
+		mutex_unlock(&inst->lock);
+		iris_core_deinit_on_error(inst->core);
+		mutex_lock(&inst->lock);
 		goto exit;
+	}
 
 exit:
 	iris_helper_buffers_done(inst, q->type, VB2_BUF_STATE_ERROR);
@@ -293,6 +298,7 @@ void iris_vb2_buf_queue(struct vb2_buffer *vb2)
 	static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb2);
 	struct v4l2_m2m_ctx *m2m_ctx;
+	enum vb2_buffer_state state;
 	struct iris_inst *inst;
 	int ret = 0;
 
@@ -343,7 +349,9 @@ void iris_vb2_buf_queue(struct vb2_buffer *vb2)
 exit:
 	if (ret) {
 		iris_inst_change_state(inst, IRIS_INST_ERROR);
-		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
+		state = vb2->vb2_queue->start_streaming_called ?
+			VB2_BUF_STATE_ERROR : VB2_BUF_STATE_QUEUED;
+		v4l2_m2m_buf_done(vbuf, state);
 	}
 	mutex_unlock(&inst->lock);
 }

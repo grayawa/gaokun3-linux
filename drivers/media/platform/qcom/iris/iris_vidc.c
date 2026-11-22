@@ -9,6 +9,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "iris_ctrls.h"
 #include "iris_vidc.h"
 #include "iris_instance.h"
 #include "iris_vdec.h"
@@ -121,6 +122,9 @@ iris_m2m_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_
 	dst_vq->drv_priv = inst;
 	dst_vq->buf_struct_size = sizeof(struct iris_buffer);
 	dst_vq->min_reqbufs_allocation = MIN_BUFFERS;
+	if (inst->domain == DECODER &&
+	    inst->core->iris_firmware_data == &iris_hfi_gen2_data)
+		dst_vq->max_num_buffers = DEFAULT_MAX_HOST_BUF_COUNT;
 	dst_vq->dev = inst->core->dev;
 	dst_vq->lock = &inst->ctx_q_lock;
 
@@ -195,6 +199,8 @@ int iris_open(struct file *filp)
 		ret = -EINVAL;
 		goto fail_m2m_release;
 	}
+
+	iris_session_init_caps(core);
 
 	if (inst->domain == DECODER)
 		ret = iris_vdec_inst_init(inst);
@@ -284,6 +290,16 @@ static void iris_check_num_queued_internal_buffers(struct iris_inst *inst, u32 p
 int iris_close(struct file *filp)
 {
 	struct iris_inst *inst = iris_get_inst(filp);
+
+	iris_wait_for_sys_error(inst->core);
+
+	mutex_lock(&inst->lock);
+	inst->closing = true;
+	if (inst->seek_resume) {
+		inst->hfi_session_ops->session_stop(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+		inst->seek_resume = false;
+	}
+	mutex_unlock(&inst->lock);
 
 	v4l2_ctrl_handler_free(&inst->ctrl_handler);
 	v4l2_m2m_ctx_release(inst->m2m_ctx);
@@ -435,14 +451,14 @@ static int iris_enum_frameintervals(struct file *filp, void *fh,
 	mbpf = NUM_MBS_PER_FRAME(fival->height, fival->width);
 	fps = DIV_ROUND_UP(core->iris_platform_data->max_core_mbps, mbpf);
 
-	fival->type = V4L2_FRMIVAL_TYPE_STEPWISE;
+	fival->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
 	fival->stepwise.min.numerator = 1;
 	fival->stepwise.min.denominator =
 			min_t(u32, fps, MAXIMUM_FPS);
 	fival->stepwise.max.numerator = 1;
 	fival->stepwise.max.denominator = 1;
 	fival->stepwise.step.numerator = 1;
-	fival->stepwise.step.denominator = MAXIMUM_FPS;
+	fival->stepwise.step.denominator = 1;
 
 	return 0;
 }

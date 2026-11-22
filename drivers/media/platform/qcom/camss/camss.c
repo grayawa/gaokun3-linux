@@ -8,6 +8,7 @@
  * Copyright (C) 2015-2018 Linaro Ltd.
  */
 #include <linux/clk.h>
+#include <linux/ctype.h>
 #include <linux/interconnect.h>
 #include <linux/media-bus-format.h>
 #include <linux/media.h>
@@ -19,6 +20,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/pm_domain.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <linux/videodev2.h>
 
 #include <media/media-device.h>
@@ -27,7 +29,20 @@
 #include <media/v4l2-mc.h>
 #include <media/v4l2-fwnode.h>
 
+#include <dt-bindings/power/qcom,rpmhpd.h>
+
 #include "camss.h"
+
+/*
+ * v4l2-async only completes the notifier after all graph endpoints bind.
+ * On boards shipped with alternate rear camera modules, an absent sensor in DT
+ * never binds and would otherwise block the working front camera as well.
+ * Wait sensor_wait_ms after probe, then re-register the notifier with only the
+ * bound endpoints (0 disables the fallback).
+ */
+static unsigned int sensor_wait_ms = 20000;
+module_param(sensor_wait_ms, uint, 0644);
+MODULE_PARM_DESC(sensor_wait_ms, "ms to wait for all sensors before continuing with the bound ones (0=off)");
 
 #define CAMSS_CLOCK_MARGIN_NUMERATOR 105
 #define CAMSS_CLOCK_MARGIN_DENOMINATOR 100
@@ -2584,7 +2599,10 @@ static const struct resources_icc icc_res_sc7280[] = {
 static const struct camss_subdev_resources csiphy_res_sc8280xp[] = {
 	/* CSIPHY0 */
 	{
-		.regulators = {},
+		.regulators = {
+			{ .supply = "vdd-csiphy01-0p88", .init_load_uA = 17500 },
+			{ .supply = "vdd-csiphy01-1p2", .init_load_uA = 10000 }
+		},
 		.clock = { "csiphy0", "csiphy0_timer" },
 		.clock_rate = { { 400000000 },
 				{ 300000000 } },
@@ -2598,7 +2616,10 @@ static const struct camss_subdev_resources csiphy_res_sc8280xp[] = {
 	},
 	/* CSIPHY1 */
 	{
-		.regulators = {},
+		.regulators = {
+			{ .supply = "vdd-csiphy01-0p88", .init_load_uA = 17500 },
+			{ .supply = "vdd-csiphy01-1p2", .init_load_uA = 10000 }
+		},
 		.clock = { "csiphy1", "csiphy1_timer" },
 		.clock_rate = { { 400000000 },
 				{ 300000000 } },
@@ -2612,7 +2633,10 @@ static const struct camss_subdev_resources csiphy_res_sc8280xp[] = {
 	},
 	/* CSIPHY2 */
 	{
-		.regulators = {},
+		.regulators = {
+			{ .supply = "vdd-csiphy23-0p88", .init_load_uA = 17500 },
+			{ .supply = "vdd-csiphy23-1p2", .init_load_uA = 10000 }
+		},
 		.clock = { "csiphy2", "csiphy2_timer" },
 		.clock_rate = { { 400000000 },
 				{ 300000000 } },
@@ -2626,7 +2650,10 @@ static const struct camss_subdev_resources csiphy_res_sc8280xp[] = {
 	},
 	/* CSIPHY3 */
 	{
-		.regulators = {},
+		.regulators = {
+			{ .supply = "vdd-csiphy23-0p88", .init_load_uA = 17500 },
+			{ .supply = "vdd-csiphy23-1p2", .init_load_uA = 10000 }
+		},
 		.clock = { "csiphy3", "csiphy3_timer" },
 		.clock_rate = { { 400000000 },
 				{ 300000000 } },
@@ -2655,6 +2682,7 @@ static const struct camss_subdev_resources csid_res_sc8280xp[] = {
 		.reg = { "csid0" },
 		.interrupt = { "csid0" },
 		.csid = {
+			.has_ipp = true,
 			.hw_ops = &csid_ops_gen2,
 			.parent_dev_ops = &vfe_parent_dev_ops,
 			.formats = &csid_formats_gen2
@@ -2674,6 +2702,7 @@ static const struct camss_subdev_resources csid_res_sc8280xp[] = {
 		.reg = { "csid1" },
 		.interrupt = { "csid1" },
 		.csid = {
+			.has_ipp = true,
 			.hw_ops = &csid_ops_gen2,
 			.parent_dev_ops = &vfe_parent_dev_ops,
 			.formats = &csid_formats_gen2
@@ -2693,6 +2722,7 @@ static const struct camss_subdev_resources csid_res_sc8280xp[] = {
 		.reg = { "csid2" },
 		.interrupt = { "csid2" },
 		.csid = {
+			.has_ipp = true,
 			.hw_ops = &csid_ops_gen2,
 			.parent_dev_ops = &vfe_parent_dev_ops,
 			.formats = &csid_formats_gen2
@@ -2712,6 +2742,7 @@ static const struct camss_subdev_resources csid_res_sc8280xp[] = {
 		.reg = { "csid3" },
 		.interrupt = { "csid3" },
 		.csid = {
+			.has_ipp = true,
 			.hw_ops = &csid_ops_gen2,
 			.parent_dev_ops = &vfe_parent_dev_ops,
 			.formats = &csid_formats_gen2
@@ -2813,7 +2844,8 @@ static const struct camss_subdev_resources vfe_res_sc8280xp[] = {
 			.pd_name = "ife0",
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
-			.formats_pix = &vfe_formats_pix_845
+			.formats_pix = &vfe_formats_pix_8280xp,
+			.formats_pix_out = &vfe_formats_pix_out_8280xp
 		}
 	},
 	/* VFE1 */
@@ -2833,7 +2865,8 @@ static const struct camss_subdev_resources vfe_res_sc8280xp[] = {
 			.pd_name = "ife1",
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
-			.formats_pix = &vfe_formats_pix_845
+			.formats_pix = &vfe_formats_pix_8280xp,
+			.formats_pix_out = &vfe_formats_pix_out_8280xp
 		}
 	},
 	/* VFE2 */
@@ -2853,7 +2886,8 @@ static const struct camss_subdev_resources vfe_res_sc8280xp[] = {
 			.pd_name = "ife2",
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
-			.formats_pix = &vfe_formats_pix_845
+			.formats_pix = &vfe_formats_pix_8280xp,
+			.formats_pix_out = &vfe_formats_pix_out_8280xp
 		}
 	},
 	/* VFE3 */
@@ -2873,7 +2907,8 @@ static const struct camss_subdev_resources vfe_res_sc8280xp[] = {
 			.pd_name = "ife3",
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
-			.formats_pix = &vfe_formats_pix_845
+			.formats_pix = &vfe_formats_pix_8280xp,
+			.formats_pix_out = &vfe_formats_pix_out_8280xp
 		}
 	},
 	/* VFE_LITE_0 */
@@ -4549,19 +4584,132 @@ inline void camss_add_clock_margin(u64 *rate)
 	*rate = div_u64(*rate, CAMSS_CLOCK_MARGIN_DENOMINATOR);
 }
 
+static bool camss_clock_name_match(const char *pattern, const char *name)
+{
+	for (; *pattern && *name; pattern++, name++)
+		if (*pattern != *name && !(*pattern == '#' && isdigit(*name)))
+			return false;
+
+	return !*pattern && !*name;
+}
+
+/* The rail level a clock needs at its current rate, 0 if not listed */
+static u32 camss_clock_level(struct camss *camss, const struct camss_clock *clock)
+{
+	const struct camss_resources *res = camss->res;
+	u32 level = 0, best = U32_MAX, top = 0;
+	unsigned long rate;
+	unsigned int i;
+	bool listed = false;
+
+	rate = clk_get_rate(clock->clk);
+	for (i = 0; i < res->clock_levels_num; i++) {
+		const struct camss_clock_level *l = &res->clock_levels[i];
+
+		if (!camss_clock_name_match(l->clock, clock->name))
+			continue;
+		listed = true;
+		top = max(top, l->level);
+		if (rate <= l->rate && l->rate < best) {
+			best = l->rate;
+			level = l->level;
+		}
+	}
+
+	if (listed && !level) {
+		dev_warn_once(camss->dev, "%s at %lu Hz is above its rail levels\n",
+			      clock->name, rate);
+		level = top;
+	}
+
+	return level;
+}
+
+/*
+ * Add (@on) or drop the clocks of one subdevice from the rail level vote on
+ * the CAMSS power domain, which passes it on to the rail (MMCX). The level is
+ * taken from the rates the clocks have now, of every subdevice: a clock
+ * several of them share (camnoc_axi) keeps the rate the last one set, which
+ * may be above what the subdevice voting for it needs.
+ */
+static int camss_vote_level(struct camss *camss, const struct camss_clock *clocks,
+			    int nclocks, bool on)
+{
+	struct device *pd = camss->genpd ?: camss->dev;
+	unsigned int i, free = CAMSS_LEVEL_VOTES, added = CAMSS_LEVEL_VOTES;
+	u32 max = 0;
+	int j, ret = 0;
+
+	mutex_lock(&camss->level_lock);
+	for (i = 0; i < CAMSS_LEVEL_VOTES; i++) {
+		if (camss->level_votes[i].clocks == clocks) {
+			if (!on)
+				camss->level_votes[i].clocks = NULL;
+			break;
+		}
+		if (!camss->level_votes[i].clocks && free == CAMSS_LEVEL_VOTES)
+			free = i;
+	}
+	if (i == CAMSS_LEVEL_VOTES && on) {
+		if (free == CAMSS_LEVEL_VOTES) {
+			ret = -ENOSPC;
+			goto out;
+		}
+		camss->level_votes[free].clocks = clocks;
+		camss->level_votes[free].nclocks = nclocks;
+		added = free;
+	}
+
+	for (i = 0; i < CAMSS_LEVEL_VOTES; i++)
+		for (j = 0; camss->level_votes[i].clocks && j < camss->level_votes[i].nclocks; j++)
+			max = max(max, camss_clock_level(camss, &camss->level_votes[i].clocks[j]));
+
+	if (max != camss->level) {
+		ret = dev_pm_genpd_set_performance_state(pd, max);
+		if (!ret) {
+			dev_dbg(camss->dev, "rail level %u -> %u\n", camss->level, max);
+			camss->level = max;
+		} else if (added < CAMSS_LEVEL_VOTES) {
+			/* The caller fails and never drops this vote */
+			camss->level_votes[added].clocks = NULL;
+		}
+	}
+out:
+	mutex_unlock(&camss->level_lock);
+	if (ret)
+		dev_err(camss->dev, "rail level %u: %d\n", max, ret);
+
+	return ret;
+}
+
 /*
  * camss_enable_clocks - Enable multiple clocks
  * @nclocks: Number of clocks in clock array
  * @clock: Clock array
  * @dev: Device
  *
+ * The rates are set: the rail level they need is voted for first, on
+ * platforms that list it.
+ *
  * Return 0 on success or a negative error code otherwise
  */
 int camss_enable_clocks(int nclocks, struct camss_clock *clock,
 			struct device *dev)
 {
+	struct camss *camss = dev_get_drvdata(dev);
+	u32 level = 0;
 	int ret;
 	int i;
+
+	if (camss && camss->res->clock_levels) {
+		for (i = 0; i < nclocks; i++)
+			level = max(level, camss_clock_level(camss, &clock[i]));
+		if (level) {
+			ret = camss_vote_level(camss, clock, nclocks, true);
+			if (ret)
+				return ret;
+		}
+	}
 
 	for (i = 0; i < nclocks; i++) {
 		ret = clk_prepare_enable(clock[i].clk);
@@ -4576,6 +4724,8 @@ int camss_enable_clocks(int nclocks, struct camss_clock *clock,
 error:
 	for (i--; i >= 0; i--)
 		clk_disable_unprepare(clock[i].clk);
+	if (level)
+		camss_vote_level(camss, clock, nclocks, false);
 
 	return ret;
 }
@@ -4584,13 +4734,21 @@ error:
  * camss_disable_clocks - Disable multiple clocks
  * @nclocks: Number of clocks in clock array
  * @clock: Clock array
+ * @dev: Device
+ *
+ * Then drop their rail level vote.
  */
-void camss_disable_clocks(int nclocks, struct camss_clock *clock)
+void camss_disable_clocks(int nclocks, struct camss_clock *clock,
+			  struct device *dev)
 {
+	struct camss *camss = dev_get_drvdata(dev);
 	int i;
 
 	for (i = nclocks - 1; i >= 0; i--)
 		clk_disable_unprepare(clock[i].clk);
+
+	if (camss && camss->res->clock_levels)
+		camss_vote_level(camss, clock, nclocks, false);
 }
 
 /*
@@ -4790,7 +4948,20 @@ static int camss_parse_endpoint_node(struct device *dev,
  *
  * Return 0 on success or a negative error code on failure
  */
-static int camss_parse_ports(struct camss *camss)
+static bool camss_sensor_is_bound(struct camss *camss, struct fwnode_handle *ep)
+{
+	struct fwnode_handle *remote = fwnode_graph_get_remote_endpoint(ep);
+	unsigned int i;
+	bool found = false;
+
+	for (i = 0; i < camss->num_bound_sensors; i++)
+		if (camss->bound_sensors[i] == remote)
+			found = true;
+	fwnode_handle_put(remote);
+	return found;
+}
+
+static int camss_parse_ports_filtered(struct camss *camss, bool bound_only)
 {
 	struct device *dev = camss->dev;
 	struct fwnode_handle *fwnode = dev_fwnode(dev), *ep;
@@ -4798,6 +4969,11 @@ static int camss_parse_ports(struct camss *camss)
 
 	fwnode_graph_for_each_endpoint(fwnode, ep) {
 		struct camss_async_subdev *csd;
+
+		if (bound_only && !camss_sensor_is_bound(camss, ep)) {
+			dev_warn(dev, "skipping endpoint %pfw: its sensor never bound\n", ep);
+			continue;
+		}
 
 		csd = v4l2_async_nf_add_fwnode_remote(&camss->notifier, ep,
 						      typeof(*csd));
@@ -4817,6 +4993,11 @@ err_cleanup:
 	fwnode_handle_put(ep);
 
 	return ret;
+}
+
+static int camss_parse_ports(struct camss *camss)
+{
+	return camss_parse_ports_filtered(camss, false);
 }
 
 /*
@@ -5017,6 +5198,30 @@ static int camss_link_entities(struct camss *camss)
 						return ret;
 					}
 				}
+
+		/*
+		 * Pixel path to the video node of another pixel path: the two
+		 * write the halves of a frame wider than one IFE takes.
+		 */
+		for (i = 0; i < camss->res->vfe_num; i++)
+			for (k = 0; k < camss->res->vfe_num; k++) {
+				struct vfe_device *a = &camss->vfe[i], *b = &camss->vfe[k];
+
+				if (i == k || !vfe_line_has_pix_pipeline(a, VFE_LINE_PIX) ||
+				    !vfe_line_has_pix_pipeline(b, VFE_LINE_PIX))
+					continue;
+				ret = media_create_pad_link(&a->line[VFE_LINE_PIX].subdev.entity,
+							    MSM_VFE_PAD_SRC,
+							    &b->line[VFE_LINE_PIX].video_out.vdev.entity,
+							    0, 0);
+				if (ret < 0) {
+					camss_link_err(camss,
+						       a->line[VFE_LINE_PIX].subdev.entity.name,
+						       b->line[VFE_LINE_PIX].video_out.vdev.name,
+						       ret);
+					return ret;
+				}
+			}
 	}
 
 	return 0;
@@ -5177,6 +5382,19 @@ static int camss_subdev_notifier_bound(struct v4l2_async_notifier *async,
 	csiphy->cfg.csi2 = &csd->interface.csi2;
 	subdev->host_priv = csiphy;
 
+	/* Record bound sensor fwnodes so the fallback notifier can filter by them */
+	if (asd->match.fwnode &&
+	    camss->num_bound_sensors < ARRAY_SIZE(camss->bound_sensors)) {
+		unsigned int i;
+
+		for (i = 0; i < camss->num_bound_sensors; i++)
+			if (camss->bound_sensors[i] == asd->match.fwnode)
+				break;
+		if (i == camss->num_bound_sensors)
+			camss->bound_sensors[camss->num_bound_sensors++] =
+				fwnode_handle_get(asd->match.fwnode);
+	}
+
 	return 0;
 }
 
@@ -5185,6 +5403,8 @@ static int camss_subdev_notifier_complete(struct v4l2_async_notifier *async)
 	struct camss *camss = container_of(async, struct camss, notifier);
 	struct v4l2_device *v4l2_dev = &camss->v4l2_dev;
 	struct v4l2_subdev *sd;
+
+	camss->notifier_complete = true;
 
 	list_for_each_entry(sd, &v4l2_dev->subdevs, list) {
 		struct csiphy_device *csiphy = sd->host_priv;
@@ -5224,6 +5444,39 @@ static const struct v4l2_async_notifier_operations camss_subdev_notifier_ops = {
 	.bound = camss_subdev_notifier_bound,
 	.complete = camss_subdev_notifier_complete,
 };
+
+static void camss_sensor_fallback_work(struct work_struct *work)
+{
+	struct camss *camss = container_of(to_delayed_work(work), struct camss,
+					   sensor_fallback_work);
+	struct v4l2_async_connection *asd;
+	int ret;
+
+	if (camss->notifier_complete)
+		return;
+
+	dev_warn(camss->dev, "not all sensors bound after %u ms; continuing with %u bound sensor(s)\n",
+		 sensor_wait_ms, camss->num_bound_sensors);
+	list_for_each_entry(asd, &camss->notifier.waiting_list, asc_entry)
+		dev_warn(camss->dev, "  never bound: %pfw\n", asd->match.fwnode);
+
+	if (!camss->num_bound_sensors)
+		return;
+
+	v4l2_async_nf_unregister(&camss->notifier);
+	v4l2_async_nf_cleanup(&camss->notifier);
+	v4l2_async_nf_init(&camss->notifier, &camss->v4l2_dev);
+	camss->notifier.ops = &camss_subdev_notifier_ops;
+
+	ret = camss_parse_ports_filtered(camss, true);
+	if (ret < 0) {
+		dev_err(camss->dev, "fallback: parsing bound endpoints failed: %d\n", ret);
+		return;
+	}
+	ret = v4l2_async_nf_register(&camss->notifier);
+	if (ret)
+		dev_err(camss->dev, "fallback: re-registering notifier failed: %d\n", ret);
+}
 
 static const struct media_device_ops camss_media_ops = {
 	.link_notify = v4l2_pipeline_link_notify,
@@ -5366,6 +5619,7 @@ static int camss_probe(struct platform_device *pdev)
 
 	atomic_set(&camss->ref_count, 0);
 	camss->dev = dev;
+	mutex_init(&camss->level_lock);
 	platform_set_drvdata(pdev, camss);
 
 	camss->csiphy = devm_kcalloc(dev, camss->res->csiphy_num,
@@ -5431,6 +5685,7 @@ static int camss_probe(struct platform_device *pdev)
 	}
 
 	v4l2_async_nf_init(&camss->notifier, &camss->v4l2_dev);
+	INIT_DELAYED_WORK(&camss->sensor_fallback_work, camss_sensor_fallback_work);
 
 	pm_runtime_enable(dev);
 
@@ -5459,6 +5714,10 @@ static int camss_probe(struct platform_device *pdev)
 			"Failed to register async subdev nodes: %d\n", ret);
 		goto err_media_device_unregister;
 	}
+
+	if (sensor_wait_ms && !camss->notifier_complete)
+		schedule_delayed_work(&camss->sensor_fallback_work,
+				      msecs_to_jiffies(sensor_wait_ms));
 
 	return 0;
 
@@ -5496,7 +5755,11 @@ void camss_delete(struct camss *camss)
 static void camss_remove(struct platform_device *pdev)
 {
 	struct camss *camss = platform_get_drvdata(pdev);
+	unsigned int i;
 
+	cancel_delayed_work_sync(&camss->sensor_fallback_work);
+	for (i = 0; i < camss->num_bound_sensors; i++)
+		fwnode_handle_put(camss->bound_sensors[i]);
 	v4l2_async_nf_unregister(&camss->notifier);
 	v4l2_async_nf_cleanup(&camss->notifier);
 	camss_unregister_entities(camss);
@@ -5668,6 +5931,33 @@ static const struct camss_resources sm8250_resources = {
 	.vfe_num = ARRAY_SIZE(vfe_res_8250),
 };
 
+/*
+ * SC8280XP camcc rail levels (MMCX), the same in the Windows PEP clock plan
+ * (qcpep8280.sys) and in the vendor's camcc-direwolf.c. Clocks only ever at
+ * LOW_SVS here are left to camcc's own vote.
+ */
+static const struct camss_clock_level clock_levels_sc8280xp[] = {
+	{ "vfe#", 400000000, RPMH_REGULATOR_LEVEL_LOW_SVS },
+	{ "vfe#", 558000000, RPMH_REGULATOR_LEVEL_SVS },
+	{ "vfe#", 637000000, RPMH_REGULATOR_LEVEL_SVS_L1 },
+	{ "vfe#", 760000000, RPMH_REGULATOR_LEVEL_NOM },
+	{ "vfe_lite#", 320000000, RPMH_REGULATOR_LEVEL_LOW_SVS },
+	{ "vfe_lite#", 400000000, RPMH_REGULATOR_LEVEL_SVS },
+	{ "vfe_lite#", 480000000, RPMH_REGULATOR_LEVEL_SVS_L1 },
+	{ "vfe_lite#", 600000000, RPMH_REGULATOR_LEVEL_NOM },
+	{ "vfe#_csid", 400000000, RPMH_REGULATOR_LEVEL_LOW_SVS },
+	{ "vfe#_csid", 480000000, RPMH_REGULATOR_LEVEL_SVS_L1 },
+	{ "vfe#_csid", 600000000, RPMH_REGULATOR_LEVEL_NOM },
+	{ "vfe_lite#_csid", 400000000, RPMH_REGULATOR_LEVEL_LOW_SVS },
+	{ "vfe_lite#_csid", 480000000, RPMH_REGULATOR_LEVEL_SVS_L1 },
+	{ "vfe_lite#_csid", 600000000, RPMH_REGULATOR_LEVEL_NOM },
+	{ "camnoc_axi", 150000000, RPMH_REGULATOR_LEVEL_LOW_SVS },
+	{ "camnoc_axi", 266666667, RPMH_REGULATOR_LEVEL_SVS },
+	{ "camnoc_axi", 320000000, RPMH_REGULATOR_LEVEL_SVS_L1 },
+	{ "camnoc_axi", 400000000, RPMH_REGULATOR_LEVEL_NOM },
+	{ "camnoc_axi", 480000000, RPMH_REGULATOR_LEVEL_TURBO },
+};
+
 static const struct camss_resources sc8280xp_resources = {
 	.version = CAMSS_8280XP,
 	.pd_name = "top",
@@ -5680,6 +5970,8 @@ static const struct camss_resources sc8280xp_resources = {
 	.csiphy_num = ARRAY_SIZE(csiphy_res_sc8280xp),
 	.csid_num = ARRAY_SIZE(csid_res_sc8280xp),
 	.vfe_num = ARRAY_SIZE(vfe_res_sc8280xp),
+	.clock_levels = clock_levels_sc8280xp,
+	.clock_levels_num = ARRAY_SIZE(clock_levels_sc8280xp),
 };
 
 static const struct camss_resources sc7280_resources = {

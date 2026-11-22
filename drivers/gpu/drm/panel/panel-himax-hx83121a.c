@@ -63,6 +63,7 @@ static const struct regulator_bulk_data himax_supplies[] = {
 	{ .supply = "vddi" },
 	{ .supply = "avdd" },
 	{ .supply = "avee" },
+	{ .supply = "bl" },
 };
 
 static inline struct himax *to_himax(struct drm_panel *panel)
@@ -766,6 +767,7 @@ static const struct panel_desc boe_ppc357db1_4_desc = {
 	.width_mm = 266,
 	.height_mm = 166,
 	.lanes = 4,
+	.bpc = 8,
 	.format = MIPI_DSI_FMT_RGB888,
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |
 		      MIPI_DSI_MODE_LPM,
@@ -785,6 +787,7 @@ static const struct panel_desc csot_ppc357db1_4_desc = {
 	.width_mm = 266,
 	.height_mm = 166,
 	.lanes = 4,
+	.bpc = 8,
 	.format = MIPI_DSI_FMT_RGB888,
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |
 		      MIPI_DSI_MODE_LPM,

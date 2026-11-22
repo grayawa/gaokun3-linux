@@ -933,9 +933,6 @@
 };
 
 &pcie2a {
-	perst-gpios = <&tlmm 143 GPIO_ACTIVE_LOW>;
-	wake-gpios = <&tlmm 145 GPIO_ACTIVE_LOW>;
-
 	vddpe-3v3-supply = <&vreg_nvme>;
 
 	pinctrl-names = "default";
@@ -951,10 +948,12 @@
 	status = "okay";
 };
 
-&pcie3a {
-	perst-gpios = <&tlmm 151 GPIO_ACTIVE_LOW>;
-	wake-gpios = <&tlmm 148 GPIO_ACTIVE_LOW>;
+&pcie2a_port0 {
+	reset-gpios = <&tlmm 143 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 145 GPIO_ACTIVE_LOW>;
+};
 
+&pcie3a {
 	vddpe-3v3-supply = <&vreg_wwan>;
 
 	pinctrl-names = "default";
@@ -970,11 +969,13 @@
 	status = "okay";
 };
 
+&pcie3a_port0 {
+	reset-gpios = <&tlmm 151 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 148 GPIO_ACTIVE_LOW>;
+};
+
 &pcie4 {
 	max-link-speed = <2>;
-
-	perst-gpios = <&tlmm 141 GPIO_ACTIVE_LOW>;
-	wake-gpios = <&tlmm 139 GPIO_ACTIVE_LOW>;
 
 	vddpe-3v3-supply = <&vreg_wlan>;
 
@@ -985,6 +986,9 @@
 };
 
 &pcie4_port0 {
+	reset-gpios = <&tlmm 141 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 139 GPIO_ACTIVE_LOW>;
+
 	wifi@0 {
 		compatible = "pci17cb,1103";
 		reg = <0x10000 0x0 0x0 0x0 0x0>;
@@ -1316,9 +1320,6 @@
 };
 
 &uart2 {
-	pinctrl-0 = <&uart2_default>;
-	pinctrl-names = "default";
-
 	status = "okay";
 
 	bluetooth {
@@ -1751,34 +1752,6 @@
 		reset-n-pins {
 			pins = "gpio99";
 			function = "gpio";
-			drive-strength = <2>;
-			bias-disable;
-		};
-	};
-
-	uart2_default: uart2-default-state {
-		cts-pins {
-			pins = "gpio121";
-			function = "qup2";
-			bias-bus-hold;
-		};
-
-		rts-pins {
-			pins = "gpio122";
-			function = "qup2";
-			drive-strength = <2>;
-			bias-disable;
-		};
-
-		rx-pins {
-			pins = "gpio124";
-			function = "qup2";
-			bias-pull-up;
-		};
-
-		tx-pins {
-			pins = "gpio123";
-			function = "qup2";
 			drive-strength = <2>;
 			bias-disable;
 		};

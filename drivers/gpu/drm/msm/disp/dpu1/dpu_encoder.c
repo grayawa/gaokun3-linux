@@ -393,10 +393,12 @@ static void _dpu_encoder_setup_dither(struct dpu_hw_pingpong *hw_pp, unsigned bp
 
 	switch (bpc) {
 	case 6:
-		dither_cfg.c0_bitdepth = 6;
-		dither_cfg.c1_bitdepth = 6;
-		dither_cfg.c2_bitdepth = 6;
-		dither_cfg.c3_bitdepth = 6;
+	case 8:
+		/* the pipeline keeps more bits than an 8 bpc panel takes too */
+		dither_cfg.c0_bitdepth = bpc;
+		dither_cfg.c1_bitdepth = bpc;
+		dither_cfg.c2_bitdepth = bpc;
+		dither_cfg.c3_bitdepth = bpc;
 		dither_cfg.temporal_en = 0;
 		break;
 	default:
@@ -649,6 +651,8 @@ struct drm_dsc_config *dpu_encoder_get_dsc_config(struct drm_encoder *drm_enc)
 
 	if (dpu_enc->disp_info.intf_type == INTF_DSI)
 		return msm_dsi_get_dsc_config(priv->kms->dsi[index]);
+	else if (dpu_enc->disp_info.intf_type == INTF_DP && priv->kms->dp[index])
+		return msm_dp_get_dsc_config(priv->kms->dp[index]);
 
 	return NULL;
 }
@@ -666,6 +670,8 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
 	struct drm_connector_state *conn_state;
 	struct drm_framebuffer *fb;
 	struct drm_dsc_config *dsc;
+	struct msm_dp *dp;
+	bool dsc_needed;
 
 	int i;
 
@@ -674,9 +680,22 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
 			topology->num_intf++;
 
 	dsc = dpu_encoder_get_dsc_config(drm_enc);
+	dsc_needed = dsc;
+	if (disp_info->intf_type == INTF_DP) {
+		connector = drm_atomic_get_new_connector_for_encoder(state, drm_enc);
+		if (!connector)
+			return;
+
+		conn_state = drm_atomic_get_new_connector_state(state, connector);
+		if (!conn_state)
+			return;
+
+		dp = priv->kms->dp[disp_info->h_tile_instance[0]];
+		dsc_needed = dp && msm_dp_dsc_needed(dp, conn_state, adj_mode);
+	}
 
 	/* We only support 2 DSC mode (with 2 LM and 1 INTF) */
-	if (dsc) {
+	if (dsc_needed) {
 		/*
 		 * Use 2 DSC encoders, 2 layer mixers and 1 or 2 interfaces
 		 * when Display Stream Compression (DSC) is enabled,
@@ -1215,9 +1234,12 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
 	num_ctl = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
 		drm_enc->crtc, DPU_HW_BLK_CTL, hw_ctl, ARRAY_SIZE(hw_ctl));
 
-	for (i = 0; i < MAX_CHANNELS_PER_ENC; i++)
+	for (i = 0; i < MAX_CHANNELS_PER_ENC; i++) {
 		dpu_enc->hw_pp[i] = i < num_pp ? to_dpu_hw_pingpong(hw_pp[i])
 						: NULL;
+		/* DSC allocation can disappear across modesets. */
+		dpu_enc->hw_dsc[i] = NULL;
+	}
 
 	num_dsc = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
 						drm_enc->crtc, DPU_HW_BLK_DSC,

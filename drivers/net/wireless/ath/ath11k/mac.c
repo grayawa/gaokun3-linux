@@ -3902,6 +3902,10 @@ void __ath11k_mac_scan_finish(struct ath11k *ar)
 			};
 
 			ieee80211_scan_completed(ar->hw, &info);
+
+			__pm_relax(ar->ab->scan_ws);
+			pm_wakeup_ws_event(ar->ab->scan_ws,
+					   ATH11K_SCAN_SETTLE_MS, false);
 		}
 
 		ar->scan.state = ATH11K_SCAN_IDLE;
@@ -4329,12 +4333,15 @@ static int ath11k_mac_op_hw_scan(struct ieee80211_hw *hw,
 	/* Add a margin to account for event/command processing */
 	scan_timeout += ATH11K_MAC_SCAN_CMD_EVT_OVERHEAD;
 
+	pm_wakeup_ws_event(ar->ab->scan_ws, scan_timeout, false);
+
 	ret = ath11k_start_scan(ar, arg);
 	if (ret) {
 		ath11k_warn(ar->ab, "failed to start hw scan: %d\n", ret);
 		spin_lock_bh(&ar->data_lock);
 		ar->scan.state = ATH11K_SCAN_IDLE;
 		spin_unlock_bh(&ar->data_lock);
+		__pm_relax(ar->ab->scan_ws);
 	}
 
 	ieee80211_queue_delayed_work(ar->hw, &ar->scan.timeout,
@@ -6167,25 +6174,27 @@ static void ath11k_mac_tx_mgmt_free(struct ath11k *ar, int buf_id)
 	ath11k_mgmt_over_wmi_tx_drop(ar, msdu);
 }
 
-int ath11k_mac_tx_mgmt_pending_free(int buf_id, void *skb, void *ctx)
+void ath11k_mac_tx_mgmt_pending_free(struct ath11k *ar)
 {
-	struct ath11k *ar = ctx;
+	struct sk_buff *msdu;
+	int buf_id;
 
-	ath11k_mac_tx_mgmt_free(ar, buf_id);
-
-	return 0;
+	idr_for_each_entry(&ar->txmgmt_idr, msdu, buf_id)
+		ath11k_mac_tx_mgmt_free(ar, buf_id);
 }
 
-static int ath11k_mac_vif_txmgmt_idr_remove(int buf_id, void *skb, void *ctx)
+static void ath11k_mac_vif_txmgmt_cleanup(struct ath11k *ar,
+					  struct ieee80211_vif *vif)
 {
-	struct ieee80211_vif *vif = ctx;
-	struct ath11k_skb_cb *skb_cb = ATH11K_SKB_CB((struct sk_buff *)skb);
-	struct ath11k *ar = skb_cb->ar;
+	struct ath11k_skb_cb *skb_cb;
+	struct sk_buff *skb;
+	int buf_id;
 
-	if (skb_cb->vif == vif)
-		ath11k_mac_tx_mgmt_free(ar, buf_id);
-
-	return 0;
+	idr_for_each_entry(&ar->txmgmt_idr, skb, buf_id) {
+		skb_cb = ATH11K_SKB_CB(skb);
+		if (skb_cb->vif == vif)
+			ath11k_mac_tx_mgmt_free(ar, buf_id);
+	}
 }
 
 static int ath11k_mac_mgmt_tx_wmi(struct ath11k *ar, struct ath11k_vif *arvif,
@@ -6622,6 +6631,18 @@ static void ath11k_mac_wait_reconfigure(struct ath11k_base *ab)
 				    ATH11K_RECONFIGURE_TIMEOUT_HZ);
 }
 
+static bool ath11k_mac_crashed_in_restart(struct ath11k *ar)
+{
+	struct ath11k_base *ab = ar->ab;
+
+	if (!test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags))
+		return false;
+
+	return ar->state == ATH11K_STATE_RESTARTED ||
+	       (ar->state == ATH11K_STATE_ON &&
+		test_bit(ATH11K_FLAG_SYSTEM_SUSPEND, &ab->dev_flags));
+}
+
 static int ath11k_mac_op_start(struct ieee80211_hw *hw)
 {
 	struct ath11k *ar = hw->priv;
@@ -6750,7 +6771,11 @@ static int ath11k_mac_op_start(struct ieee80211_hw *hw)
 	return 0;
 
 err:
-	ar->state = ATH11K_STATE_OFF;
+	if (ath11k_mac_crashed_in_restart(ar))
+		ret = 0;
+	else
+		ar->state = ATH11K_STATE_OFF;
+
 	mutex_unlock(&ar->conf_mutex);
 
 	return ret;
@@ -7339,10 +7364,13 @@ err_peer_del:
 err_vdev_del:
 	ath11k_mac_vdev_delete(ar, arvif);
 	spin_lock_bh(&ar->data_lock);
-	list_del(&arvif->list);
+	list_del_init(&arvif->list);
 	spin_unlock_bh(&ar->data_lock);
 
 err:
+	if (ath11k_mac_crashed_in_restart(ar))
+		ret = 0;
+
 	mutex_unlock(&ar->conf_mutex);
 
 	return ret;
@@ -7417,8 +7445,7 @@ err_vdev_del:
 
 	ath11k_peer_cleanup(ar, arvif->vdev_id);
 
-	idr_for_each(&ar->txmgmt_idr,
-		     ath11k_mac_vif_txmgmt_idr_remove, vif);
+	ath11k_mac_vif_txmgmt_cleanup(ar, vif);
 
 	for (i = 0; i < ab->hw_params.hal_params->num_tx_rings; i++) {
 		spin_lock_bh(&ab->dp.tx_ring[i].tx_idr_lock);
@@ -9266,6 +9293,7 @@ ath11k_mac_op_reconfig_complete(struct ieee80211_hw *hw,
 	struct ath11k_base *ab = ar->ab;
 	int recovery_count;
 	struct ath11k_vif *arvif;
+	bool crashed;
 
 	if (reconfig_type != IEEE80211_RECONFIG_TYPE_RESTART)
 		return;
@@ -9273,8 +9301,13 @@ ath11k_mac_op_reconfig_complete(struct ieee80211_hw *hw,
 	mutex_lock(&ar->conf_mutex);
 
 	if (ar->state == ATH11K_STATE_RESTARTED) {
-		ath11k_warn(ar->ab, "pdev %d successfully recovered\n",
-			    ar->pdev->pdev_id);
+		crashed = test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+		if (crashed)
+			ath11k_warn(ab, "pdev %d restarted without firmware\n",
+				    ar->pdev->pdev_id);
+		else
+			ath11k_warn(ab, "pdev %d successfully recovered\n",
+				    ar->pdev->pdev_id);
 		ar->state = ATH11K_STATE_ON;
 		ieee80211_wake_queues(ar->hw);
 
@@ -9290,18 +9323,15 @@ ath11k_mac_op_reconfig_complete(struct ieee80211_hw *hw,
 			 * the recovery has to be done for each radio
 			 */
 			if (recovery_count == ab->num_radios) {
+				ab->is_reset = false;
+				if (!crashed) {
+					__pm_relax(ab->recovery_ws);
+					pm_wakeup_ws_event(ab->recovery_ws,
+							   ATH11K_RECOVERY_SETTLE_MS,
+							   false);
+				}
 				atomic_dec(&ab->reset_count);
 				complete(&ab->reset_complete);
-				ab->is_reset = false;
-				atomic_set(&ab->fail_cont_count, 0);
-				/*
-				 * Stay awake a little longer: WoW on firmware
-				 * that has only just restarted crashes it again,
-				 * and the connection needs a moment to return.
-				 */
-				__pm_relax(ab->recovery_ws);
-				pm_wakeup_ws_event(ab->recovery_ws,
-						   ATH11K_RECOVERY_SETTLE_MS, false);
 				ath11k_dbg(ab, ATH11K_DBG_BOOT, "reset success\n");
 			}
 		}
@@ -10007,6 +10037,8 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
 		mutex_unlock(&ar->ab->tbl_mtx_lock);
 
 		ath11k_cfr_decrement_peer_count(ar, arsta);
+
+		ret = 0;
 	} else if (old_state == IEEE80211_STA_AUTH &&
 		   new_state == IEEE80211_STA_ASSOC &&
 		   (vif->type == NL80211_IFTYPE_AP ||
@@ -10429,7 +10461,7 @@ static void __ath11k_mac_unregister(struct ath11k *ar)
 
 	ieee80211_unregister_hw(ar->hw);
 
-	idr_for_each(&ar->txmgmt_idr, ath11k_mac_tx_mgmt_pending_free, ar);
+	ath11k_mac_tx_mgmt_pending_free(ar);
 	idr_destroy(&ar->txmgmt_idr);
 
 	kfree(ar->mac.sbands[NL80211_BAND_2GHZ].channels);

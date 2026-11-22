@@ -15,6 +15,8 @@
 #include <drm/display/drm_dp_aux_bus.h>
 #include <drm/display/drm_hdmi_audio_helper.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_modeset_lock.h>
+#include <drm/drm_probe_helper.h>
 
 #include "msm_drv.h"
 #include "msm_kms.h"
@@ -33,6 +35,9 @@ module_param(psr_enabled, bool, 0);
 MODULE_PARM_DESC(psr_enabled, "enable PSR for eDP and DP displays");
 
 #define HPD_STRING_SIZE 30
+
+#define HPD_RECOVERY_MAX_TRIES	5
+#define HPD_RECOVERY_DELAY_MS	500
 
 enum {
 	ISR_DISCONNECTED,
@@ -55,6 +60,9 @@ struct msm_dp_display_private {
 
 	struct mutex plugged_lock;
 	bool plugged;
+
+	struct delayed_work hpd_recovery_work;
+	unsigned int hpd_recovery_tries;
 
 	struct drm_device *drm_dev;
 
@@ -233,8 +241,11 @@ static void msm_dp_display_unbind(struct device *dev, struct device *master,
 	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
 	struct msm_drm_private *priv = dev_get_drvdata(master);
 
+	cancel_delayed_work_sync(&dp->hpd_recovery_work);
+
 	of_dp_aux_depopulate_bus(dp->aux);
 
+	drm_dp_cec_unregister_connector(dp->aux);
 	msm_dp_aux_unregister(dp->aux);
 	dp->drm_dev = NULL;
 	dp->aux->drm_dev = NULL;
@@ -389,16 +400,99 @@ static int msm_dp_display_handle_irq_hpd(struct msm_dp_display_private *dp)
 	return 0;
 }
 
+static void msm_dp_display_handle_plugged_change(struct msm_dp *msm_dp_display,
+		bool plugged);
+
+static void msm_dp_display_audio_restore(struct msm_dp_display_private *dp)
+{
+	if (!dp->audio_supported)
+		return;
+
+	dp->audio->bw_code = drm_dp_link_rate_to_bw_code(dp->link->link_params.rate);
+	dp->audio->lane_count = dp->link->link_params.num_lanes;
+	msm_dp_audio_restore(&dp->msm_dp_display);
+}
+
+static void msm_dp_hpd_recovery_work(struct work_struct *work)
+{
+	struct delayed_work *dw = to_delayed_work(work);
+	struct msm_dp_display_private *dp =
+		container_of(dw, struct msm_dp_display_private, hpd_recovery_work);
+	struct drm_connector *connector = dp->msm_dp_display.connector;
+	struct drm_device *dev = dp->drm_dev;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc *crtc;
+	int rc = 0;
+	int ret;
+
+	if (!dp->msm_dp_display.power_on || !dp->plugged) {
+		dp->hpd_recovery_tries = 0;
+		return;
+	}
+
+	/* clocks stay on, and the locks serialize any concurrent commit */
+	drm_modeset_acquire_init(&ctx, 0);
+
+retry:
+	ret = drm_modeset_lock(&dev->mode_config.connection_mutex, &ctx);
+	if (ret)
+		goto unlock;
+
+	crtc = connector->state->crtc;
+	if (crtc) {
+		ret = drm_modeset_lock(&crtc->mutex, &ctx);
+		if (ret)
+			goto unlock;
+	}
+
+	if (dp->msm_dp_display.power_on && dp->plugged)
+		rc = msm_dp_ctrl_retrain_link(dp->ctrl);
+
+unlock:
+	if (ret == -EDEADLK) {
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	if (rc) {
+		if (++dp->hpd_recovery_tries < HPD_RECOVERY_MAX_TRIES) {
+			schedule_delayed_work(&dp->hpd_recovery_work,
+					      msecs_to_jiffies(HPD_RECOVERY_DELAY_MS));
+			return;
+		}
+
+		DRM_ERROR("link recovery failed after %u tries. rc=%d\n",
+			  dp->hpd_recovery_tries, rc);
+		dp->hpd_recovery_tries = 0;
+		/* LINK_STATUS_BAD is still set, let userspace do a fresh modeset */
+		drm_kms_helper_connector_hotplug_event(dp->msm_dp_display.connector);
+		return;
+	}
+
+	dp->hpd_recovery_tries = 0;
+
+	/* the retrain may have landed on new link parameters */
+	msm_dp_display_audio_restore(dp);
+
+	drm_connector_set_link_status_property(dp->msm_dp_display.connector,
+					       DRM_MODE_LINK_STATUS_GOOD);
+}
+
 static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
 {
 	int ret;
 	struct platform_device *pdev = dp->msm_dp_display.pdev;
+	bool was_plugged;
 
 	drm_dbg_dp(dp->drm_dev, "Before, type=%d sink_count=%d\n",
 			dp->msm_dp_display.connector_type,
 			dp->link->sink_count);
 
 	guard(mutex)(&dp->plugged_lock);
+	was_plugged = dp->plugged;
 
 	ret = pm_runtime_resume_and_get(&pdev->dev);
 	if (ret) {
@@ -411,6 +505,21 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
 	msm_dp_display_host_phy_init(dp);
 
 	ret = msm_dp_display_process_hpd_high(dp);
+
+	if (!ret && dp->msm_dp_display.power_on && !was_plugged) {
+		/*
+		 * The sink was replugged while the DP stream is active.
+		 * Userspace may not perform a modeset in response to
+		 * LINK_STATUS_BAD on Wayland compositors. Schedule deferred
+		 * link recovery to avoid racing with DPU commits.
+		 */
+		drm_connector_set_link_status_property(dp->msm_dp_display.connector,
+						       DRM_MODE_LINK_STATUS_BAD);
+
+		dp->hpd_recovery_tries = 0;
+		schedule_delayed_work(&dp->hpd_recovery_work,
+				      msecs_to_jiffies(HPD_RECOVERY_DELAY_MS));
+	}
 
 	drm_dbg_dp(dp->drm_dev, "After, type=%d sink_count=%d\n",
 			dp->msm_dp_display.connector_type,
@@ -441,6 +550,7 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
 
 	dp->panel->video_test = false;
 
+	drm_dp_cec_unset_edid(dp->aux);
 	msm_dp_aux_enable_xfers(dp->aux, false);
 
 	drm_dbg_dp(dp->drm_dev, "Before, type=%d sink_count=%d\n",
@@ -504,6 +614,10 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
 		else
 			rc = msm_dp_display_handle_irq_hpd(dp);
 	}
+	drm_dp_cec_irq(dp->aux);
+
+	/* link maintenance from a sink request leaves the audio SDPs off */
+	msm_dp_display_audio_restore(dp);
 
 	drm_dbg_dp(dp->drm_dev, "After, type=%d, sink_count=%d\n",
 			dp->msm_dp_display.connector_type,
@@ -552,7 +666,8 @@ static int msm_dp_init_sub_modules(struct msm_dp_display_private *dp)
 		goto error_link;
 	}
 
-	dp->panel = msm_dp_panel_get(dev, dp->aux, dp->link, dp->link_base, dp->p0_base);
+	dp->panel = msm_dp_panel_get(dev, dp->aux, dp->link,
+				     dp->link_base, dp->p0_base);
 	if (IS_ERR(dp->panel)) {
 		rc = PTR_ERR(dp->panel);
 		DRM_ERROR("failed to initialize panel, rc = %d\n", rc);
@@ -636,6 +751,13 @@ static int msm_dp_display_post_enable(struct msm_dp *msm_dp_display)
 	/* signal the connect event late to synchronize video and display */
 	msm_dp_display_handle_plugged_change(msm_dp_display, true);
 
+	/* a stream left open across the disable never issues a new prepare */
+	if (msm_dp_display->audio_restore_pending) {
+		msm_dp_display->audio_restore_pending = false;
+		msm_dp_display->audio_enabled = true;
+		msm_dp_audio_restore(msm_dp_display);
+	}
+
 	if (msm_dp_display->psr_supported)
 		msm_dp_ctrl_config_psr(dp->ctrl);
 
@@ -654,8 +776,11 @@ static int msm_dp_display_disable(struct msm_dp_display_private *dp)
 		/* signal the disconnect event */
 		msm_dp_display_handle_plugged_change(msm_dp_display, false);
 		if (!wait_for_completion_timeout(&dp->audio_comp,
-				HZ * 5))
+				HZ * 5)) {
 			DRM_ERROR("audio comp timeout\n");
+			/* the PCM is still open, no new prepare will come */
+			msm_dp_display->audio_restore_pending = true;
+		}
 	}
 
 	msm_dp_display->audio_enabled = false;
@@ -681,6 +806,26 @@ static int msm_dp_display_disable(struct msm_dp_display_private *dp)
 	return 0;
 }
 
+static u32 msm_dp_display_get_source_bpp(const struct drm_connector *connector,
+					 const struct drm_connector_state *conn_state)
+{
+	const u32 num_components = 3, default_bpc = 8;
+	u32 bpc;
+
+	bpc = connector->display_info.bpc;
+	if (!bpc)
+		bpc = default_bpc;
+
+	if (connector->max_bpc_property) {
+		if (!conn_state)
+			conn_state = connector->state;
+
+		if (conn_state)
+			bpc = min_t(u32, bpc, conn_state->max_requested_bpc);
+	}
+
+	return bpc * num_components;
+}
 /**
  * msm_dp_bridge_mode_valid - callback to determine if specified mode is valid
  * @bridge: Pointer to drm bridge structure
@@ -692,10 +837,10 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
 					  const struct drm_display_info *info,
 					  const struct drm_display_mode *mode)
 {
-	const u32 num_components = 3, default_bpp = 24;
 	struct msm_dp_display_private *msm_dp_display;
 	struct msm_dp_link_info *link_info;
 	u32 mode_rate_khz = 0, supported_rate_khz = 0, mode_bpp = 0;
+	u32 source_bpp;
 	struct msm_dp *dp;
 	int mode_pclk_khz = mode->clock;
 	int link_pclk_khz;
@@ -728,12 +873,15 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	if (mode_pclk_khz > DP_MAX_PIXEL_CLK_KHZ)
 		return MODE_CLOCK_HIGH;
 
-	mode_bpp = dp->connector->display_info.bpc * num_components;
-	if (!mode_bpp)
-		mode_bpp = default_bpp;
+	source_bpp = msm_dp_display_get_source_bpp(dp->connector, NULL);
+
+	if (!is_yuv_420 &&
+	    msm_dp_panel_dsc_needed(msm_dp_display->panel, mode, source_bpp,
+				    mode->clock))
+		return MODE_OK;
 
 	mode_bpp = msm_dp_panel_get_mode_bpp(msm_dp_display->panel,
-			mode_bpp, link_pclk_khz);
+			source_bpp, link_pclk_khz);
 
 	mode_rate_khz = link_pclk_khz * mode_bpp;
 	supported_rate_khz = link_info->num_lanes * link_info->rate * 8;
@@ -937,14 +1085,19 @@ static irqreturn_t msm_dp_display_irq_handler(int irq, void *dev_id)
 static irqreturn_t msm_dp_display_irq_thread(int irq, void *dev_id)
 {
 	struct msm_dp_display_private *dp = dev_id;
+	struct platform_device *pdev = dp->msm_dp_display.pdev;
 	irqreturn_t ret = IRQ_NONE;
 	unsigned long flags;
 	u32 hpd_isr_status;
+	int rc;
+	bool was_plugged;
 
 	spin_lock_irqsave(&dp->irq_thread_lock, flags);
 	hpd_isr_status = dp->hpd_isr_status;
 	dp->hpd_isr_status = 0;
 	spin_unlock_irqrestore(&dp->irq_thread_lock, flags);
+
+	was_plugged = dp->plugged;
 
 	if (hpd_isr_status & DP_DP_HPD_UNPLUG_INT_MASK)
 		drm_bridge_hpd_notify(dp->msm_dp_display.bridge,
@@ -954,10 +1107,30 @@ static irqreturn_t msm_dp_display_irq_thread(int irq, void *dev_id)
 		drm_bridge_hpd_notify(dp->msm_dp_display.bridge,
 				      connector_status_connected);
 
-	/* Send HPD as connected and distinguish it in the notifier */
-	if (hpd_isr_status & DP_DP_IRQ_HPD_INT_MASK)
+	/*
+	 * A replug is a sink that went away and came back before the controller
+	 * could report the two edges apart. What sits behind the connector may
+	 * not be what was there before, so retire the old sink and announce the
+	 * new one rather than assume nothing happened.
+	 */
+	if (hpd_isr_status & DP_DP_HPD_REPLUG_INT_MASK) {
+		if (was_plugged)
+			drm_bridge_hpd_notify(dp->msm_dp_display.bridge,
+					      connector_status_disconnected);
+
 		drm_bridge_hpd_notify(dp->msm_dp_display.bridge,
 				      connector_status_connected);
+	}
+
+	if (hpd_isr_status & DP_DP_IRQ_HPD_INT_MASK) {
+		rc = pm_runtime_resume_and_get(&pdev->dev);
+		if (rc)
+			DRM_ERROR("failed to pm_runtime_resume\n");
+		else
+			msm_dp_irq_hpd_handle(dp);
+		if (!rc)
+			pm_runtime_put_sync(&pdev->dev);
+	}
 
 	ret = IRQ_HANDLED;
 
@@ -1164,6 +1337,7 @@ static int msm_dp_display_probe(struct platform_device *pdev)
 	dp->hpd_isr_status = 0;
 
 	mutex_init(&dp->plugged_lock);
+	INIT_DELAYED_WORK(&dp->hpd_recovery_work, msm_dp_hpd_recovery_work);
 
 	rc = msm_dp_display_get_io(dp);
 	if (rc)
@@ -1270,6 +1444,8 @@ static struct platform_driver msm_dp_display_driver = {
 		.suppress_bind_attrs = true,
 		.pm = &msm_dp_pm_ops,
 	},
+	/* Apply clock parents after PHY is fully initialized */
+	.driver_managed_clk_defaults = true,
 };
 
 int __init msm_dp_register(void)
@@ -1288,10 +1464,30 @@ void __exit msm_dp_unregister(void)
 	platform_driver_unregister(&msm_dp_display_driver);
 }
 
+static bool msm_dp_colorspace_needs_vsc_sdp(enum drm_colorspace colorspace)
+{
+	switch (colorspace) {
+	case DRM_MODE_COLORIMETRY_BT2020_RGB:
+	case DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65:
+		return true;
+	default:
+		return false;
+	}
+}
+
 bool msm_dp_needs_periph_flush(const struct msm_dp *msm_dp_display,
 			       const struct drm_display_mode *mode)
 {
-	return drm_mode_is_420_only(&msm_dp_display->connector->display_info, mode);
+	struct msm_dp_display_private *dp;
+	struct drm_connector_state *conn_state;
+
+	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+	conn_state = msm_dp_display->connector ? msm_dp_display->connector->state : NULL;
+
+	return drm_mode_is_420_only(&msm_dp_display->connector->display_info, mode) ||
+	       msm_dp_panel_dsc_enabled(dp->panel) ||
+	       (dp->panel->vsc_sdp_supported && conn_state &&
+		msm_dp_colorspace_needs_vsc_sdp(conn_state->colorspace));
 }
 
 bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
@@ -1304,6 +1500,36 @@ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
 		return false;
 
 	return dp->wide_bus_supported;
+}
+
+struct drm_dsc_config *msm_dp_get_dsc_config(struct msm_dp *msm_dp_display)
+{
+	struct msm_dp_display_private *dp;
+
+	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+
+	return msm_dp_panel_get_dsc_config(dp->panel);
+}
+
+bool msm_dp_dsc_needed(const struct msm_dp *msm_dp_display,
+		       const struct drm_connector_state *conn_state,
+		       const struct drm_display_mode *mode)
+{
+	struct msm_dp_display_private *dp;
+	u32 source_bpp;
+	int mode_pclk_khz = mode->clock;
+	bool yuv420;
+
+	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+	yuv420 = drm_mode_is_420_only(&msm_dp_display->connector->display_info, mode);
+
+	if (yuv420)
+		return false;
+
+	source_bpp = msm_dp_display_get_source_bpp(msm_dp_display->connector,
+						   conn_state);
+
+	return msm_dp_panel_dsc_needed(dp->panel, mode, source_bpp, mode_pclk_khz);
 }
 
 void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *root, bool is_edp)
@@ -1347,6 +1573,7 @@ int msm_dp_modeset_init(struct msm_dp *msm_dp_display, struct drm_device *dev,
 	}
 
 	msm_dp_priv->panel->connector = msm_dp_display->connector;
+	drm_dp_cec_register_connector(msm_dp_priv->aux, msm_dp_display->connector);
 
 	return 0;
 }
@@ -1356,11 +1583,27 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 {
 	struct msm_dp_bridge *msm_dp_bridge = to_dp_bridge(drm_bridge);
 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
+	struct drm_connector_state *conn_state = NULL;
 	int rc = 0;
 	struct msm_dp_display_private *msm_dp_display;
 	bool force_link_train = false;
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+
+	if (state && !dp->is_edp && dp->connector)
+		conn_state = drm_atomic_get_new_connector_state(state, dp->connector);
+	if (!conn_state && !dp->is_edp && dp->connector)
+		conn_state = dp->connector->state;
+
+	if (conn_state) {
+		msm_dp_panel_set_colorspace(msm_dp_display->panel, conn_state->colorspace);
+		rc = msm_dp_panel_set_hdr_metadata(msm_dp_display->panel, conn_state);
+		if (rc) {
+			DRM_ERROR("failed to set HDR metadata, rc=%d\n", rc);
+			return;
+		}
+	}
+
 	if (!msm_dp_display->msm_dp_mode.drm_mode.clock) {
 		DRM_ERROR("invalid params\n");
 		return;
@@ -1390,9 +1633,10 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 
 	rc = msm_dp_ctrl_on_link(msm_dp_display->ctrl);
 	if (rc) {
-		DRM_ERROR("Failed link training (rc=%d)\n", rc);
-		// TODO: schedule drm_connector_set_link_status_property()
-		return;
+		/* link status cannot be set from commit context */
+		DRM_ERROR("Failed link training (rc=%d), scheduling recovery\n", rc);
+		mod_delayed_work(system_wq, &msm_dp_display->hpd_recovery_work,
+				 msecs_to_jiffies(HPD_RECOVERY_DELAY_MS));
 	}
 
 	msm_dp_display_enable(msm_dp_display, force_link_train);
@@ -1459,6 +1703,8 @@ void msm_dp_bridge_mode_set(struct drm_bridge *drm_bridge,
 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
 	struct msm_dp_display_private *msm_dp_display;
 	struct msm_dp_panel *msm_dp_panel;
+	int mode_pclk_khz;
+	int rc;
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
 	msm_dp_panel = msm_dp_display->panel;
@@ -1468,10 +1714,8 @@ void msm_dp_bridge_mode_set(struct drm_bridge *drm_bridge,
 	if (msm_dp_display_check_video_test(dp))
 		msm_dp_display->msm_dp_mode.bpp = msm_dp_display_get_test_bpp(dp);
 	else /* Default num_components per pixel = 3 */
-		msm_dp_display->msm_dp_mode.bpp = dp->connector->display_info.bpc * 3;
-
-	if (!msm_dp_display->msm_dp_mode.bpp)
-		msm_dp_display->msm_dp_mode.bpp = 24; /* Default bpp */
+		msm_dp_display->msm_dp_mode.bpp =
+			msm_dp_display_get_source_bpp(dp->connector, NULL);
 
 	drm_mode_copy(&msm_dp_display->msm_dp_mode.drm_mode, adjusted_mode);
 
@@ -1488,6 +1732,23 @@ void msm_dp_bridge_mode_set(struct drm_bridge *drm_bridge,
 	/* populate wide_bus_support to different layers */
 	msm_dp_display->ctrl->wide_bus_en =
 		msm_dp_display->msm_dp_mode.out_fmt_is_yuv_420 ? false : msm_dp_display->wide_bus_supported;
+
+	mode_pclk_khz = adjusted_mode->clock;
+	if (msm_dp_display->msm_dp_mode.out_fmt_is_yuv_420)
+		mode_pclk_khz /= 2;
+
+	if (msm_dp_display->msm_dp_mode.out_fmt_is_yuv_420) {
+		msm_dp_panel->dsc_en = false;
+		msm_dp_panel->fec_en = false;
+		memset(&msm_dp_panel->dsc, 0, sizeof(msm_dp_panel->dsc));
+		return;
+	}
+
+	rc = msm_dp_panel_prepare_dsc(msm_dp_panel, adjusted_mode,
+				      msm_dp_display->msm_dp_mode.bpp,
+				      mode_pclk_khz);
+	if (rc)
+		DRM_ERROR("failed to prepare DSC, rc=%d\n", rc);
 }
 
 void msm_dp_bridge_hpd_enable(struct drm_bridge *bridge)

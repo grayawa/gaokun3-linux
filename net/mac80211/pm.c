@@ -118,7 +118,6 @@ int __ieee80211_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wowlan,
 		if (err < 0) {
 			local->quiescing = false;
 			local->wowlan = false;
-			/* the system stays up, see ieee80211_mgd_probe_ap() */
 			local->suspending = false;
 			if (ieee80211_hw_check(hw, AMPDU_AGGREGATION)) {
 				lockdep_assert_wiphy(local->hw.wiphy);

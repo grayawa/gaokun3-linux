@@ -23,6 +23,8 @@
 #define CAMSS_FRAME_MIN_HEIGHT		1
 #define CAMSS_FRAME_MAX_HEIGHT_RDI	8191
 #define CAMSS_FRAME_MAX_HEIGHT_PIX	4096
+/* Lines of a line based plane: single plane YUV 4:2:0 adds half the height */
+#define CAMSS_FRAME_MAX_LINES_PIX	(CAMSS_FRAME_MAX_HEIGHT_PIX * 3 / 2)
 
 /* -----------------------------------------------------------------------------
  * Helper functions
@@ -206,17 +208,33 @@ static void video_buf_queue(struct vb2_buffer *vb)
 	video->ops->queue_buffer(video, buffer);
 }
 
+static struct v4l2_subdev *video_extra_source(struct camss_video *video, u32 *pad);
+
 static int video_check_format(struct camss_video *video)
 {
 	struct v4l2_pix_format_mplane *pix = &video->active_fmt.fmt.pix_mp;
 	struct v4l2_format format;
 	struct v4l2_pix_format_mplane *sd_pix = &format.fmt.pix_mp;
+	struct v4l2_subdev_format extra_fmt = { 0 };
+	struct v4l2_subdev *extra;
 	int ret;
 
 	sd_pix->pixelformat = pix->pixelformat;
 	ret = video_get_subdev_format(video, &format);
 	if (ret < 0)
 		return ret;
+
+	/* Dual IFE: the frame is the two stripes side by side */
+	extra = video_extra_source(video, &extra_fmt.pad);
+	if (extra) {
+		extra_fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+		ret = v4l2_subdev_call(extra, pad, get_fmt, NULL, &extra_fmt);
+		if (ret)
+			return ret;
+		if (extra_fmt.format.height != sd_pix->height)
+			return -EPIPE;
+		sd_pix->width += extra_fmt.format.width;
+	}
 
 	dev_dbg(video->camss->dev,
 		"%s: format is (%ux%u %p4cc/%up field:%u), trying (%ux%u %p4cc/%up field:%u)",
@@ -249,13 +267,92 @@ static int video_prepare_streaming(struct vb2_queue *q)
 	return ret;
 }
 
+/*
+ * A second pixel path linked to this video node (dual IFE): the subdev that
+ * writes the other stripe, or NULL.
+ */
+static struct v4l2_subdev *video_extra_source(struct camss_video *video, u32 *pad)
+{
+	struct media_pad *first = media_pad_remote_pad_first(&video->pad);
+	struct media_link *link;
+
+	for_each_media_entity_data_link(&video->vdev.entity, link) {
+		if (link->sink != &video->pad || !(link->flags & MEDIA_LNK_FL_ENABLED) ||
+		    link->source == first ||
+		    !is_media_entity_v4l2_subdev(link->source->entity))
+			continue;
+		if (pad)
+			*pad = link->source->index;
+		return media_entity_to_v4l2_subdev(link->source->entity);
+	}
+
+	return NULL;
+}
+
+/* Whether @entity is upstream of the video node through its first link */
+static bool video_chain_has(struct camss_video *video, struct media_entity *entity)
+{
+	struct media_entity *e = &video->vdev.entity;
+	struct media_pad *pad;
+
+	while (1) {
+		pad = &e->pads[0];
+		if (!(pad->flags & MEDIA_PAD_FL_SINK))
+			return false;
+		pad = media_pad_remote_pad_first(pad);
+		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+			return false;
+		e = pad->entity;
+		if (e == entity)
+			return true;
+	}
+}
+
+/*
+ * Video nodes can share the subdevs upstream of a VFE line: the pixel path and
+ * an RDI fed by the same CSID run from the same sensor stream, and the display
+ * output of a VFE takes its frames from the pixel path, whose own video node
+ * streams too. Whether another enabled link leads from @entity to a streaming
+ * subdev or video node other than @from.
+ */
+static bool video_entity_shared(struct media_entity *entity,
+				struct media_entity *from)
+{
+	struct media_link *link;
+
+	for_each_media_entity_data_link(entity, link) {
+		struct media_entity *sink = link->sink->entity;
+
+		if (link->source->entity != entity ||
+		    !(link->flags & MEDIA_LNK_FL_ENABLED) || sink == from)
+			continue;
+		if (is_media_entity_v4l2_subdev(sink) &&
+		    media_entity_to_v4l2_subdev(sink)->s_stream_enabled)
+			return true;
+		if (is_media_entity_v4l2_video_device(sink)) {
+			struct video_device *vdev = media_entity_to_video_device(sink);
+
+			if (vdev->queue && vb2_start_streaming_called(vdev->queue))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/* Subdevs one stream start may start: the other stripe's two, its own four */
+#define VIDEO_MAX_STARTED	8
+
 static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct camss_video *video = vb2_get_drv_priv(q);
 	struct video_device *vdev = &video->vdev;
+	struct v4l2_subdev *started[VIDEO_MAX_STARTED];
+	unsigned int nstarted = 0;
 	struct media_entity *entity;
 	struct media_pad *pad;
 	struct v4l2_subdev *subdev;
+	bool first = true;
 	int ret;
 
 	ret = video_device_pipeline_alloc_start(vdev);
@@ -267,6 +364,37 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 	ret = video_check_format(video);
 	if (ret < 0)
 		goto error;
+
+	/*
+	 * Dual IFE: start the other stripe's pixel path and CSID first, up to
+	 * what it shares with this chain, so that the CSIPHY and the sensor
+	 * start last and both CSIDs see the first frame.
+	 */
+	subdev = video_extra_source(video, NULL);
+	/* The other stripe's pixel path must be free: it writes this node */
+	if (subdev && !video_chain_has(video, &subdev->entity) &&
+	    subdev->s_stream_enabled) {
+		ret = -EBUSY;
+		goto error;
+	}
+	while (subdev) {
+		entity = &subdev->entity;
+		if (video_chain_has(video, entity) || subdev->s_stream_enabled)
+			break;
+		if (nstarted == VIDEO_MAX_STARTED) {
+			ret = -EINVAL;
+			goto error;
+		}
+		ret = v4l2_subdev_call(subdev, video, s_stream, 1);
+		if (ret < 0 && ret != -ENOIOCTLCMD)
+			goto error;
+		started[nstarted++] = subdev;
+		pad = media_pad_remote_pad_first(&entity->pads[0]);
+		if (!(entity->pads[0].flags & MEDIA_PAD_FL_SINK) || !pad ||
+		    !is_media_entity_v4l2_subdev(pad->entity))
+			break;
+		subdev = media_entity_to_v4l2_subdev(pad->entity);
+	}
 
 	entity = &vdev->entity;
 	while (1) {
@@ -281,14 +409,41 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 		entity = pad->entity;
 		subdev = media_entity_to_v4l2_subdev(entity);
 
+		/*
+		 * Shared with a node that streams already, as is all upstream.
+		 * Not the line that feeds this node: its output already goes
+		 * elsewhere (a dual IFE slave writes the master's node).
+		 */
+		if (subdev->s_stream_enabled) {
+			if (first) {
+				ret = -EBUSY;
+				goto error;
+			}
+			break;
+		}
+		first = false;
+
+		if (nstarted == VIDEO_MAX_STARTED) {
+			ret = -EINVAL;
+			goto error;
+		}
 		ret = v4l2_subdev_call(subdev, video, s_stream, 1);
 		if (ret < 0 && ret != -ENOIOCTLCMD)
 			goto error;
+		started[nstarted++] = subdev;
 	}
 
 	return 0;
 
 error:
+	/*
+	 * Stop what this start started, the last first: a subdev left
+	 * streaming keeps its state (a dual IFE pairing, the VFE line) into
+	 * the next start.
+	 */
+	while (nstarted)
+		v4l2_subdev_call(started[--nstarted], video, s_stream, 0);
+
 	video_device_pipeline_stop(vdev);
 
 flush_buffers:
@@ -304,6 +459,8 @@ static void video_stop_streaming(struct vb2_queue *q)
 	struct media_entity *entity;
 	struct media_pad *pad;
 	struct v4l2_subdev *subdev;
+	struct media_entity *from;
+	bool first = true;
 	int ret;
 
 	entity = &vdev->entity;
@@ -316,8 +473,28 @@ static void video_stop_streaming(struct vb2_queue *q)
 		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
 			break;
 
+		from = entity;
 		entity = pad->entity;
 		subdev = media_entity_to_v4l2_subdev(entity);
+
+		/*
+		 * Stopped already by the node that started it (the pixel path
+		 * of a display output, by its own node): what streams upstream
+		 * streams for other nodes.
+		 */
+		if (!subdev->s_stream_enabled)
+			break;
+
+		/*
+		 * The subdev that feeds this node was started by it (see
+		 * video_start_streaming()) and stops with it, together with
+		 * what it feeds besides: the pixel path stops its display
+		 * output. Upstream, a subdev still feeding another streaming
+		 * node keeps running, and all upstream of it.
+		 */
+		if (!first && video_entity_shared(entity, from))
+			break;
+		first = false;
 
 		ret = v4l2_subdev_call(subdev, video, s_stream, 0);
 
@@ -325,6 +502,22 @@ static void video_stop_streaming(struct vb2_queue *q)
 			dev_err(video->camss->dev, "Video pipeline stop failed: %d\n", ret);
 			return;
 		}
+	}
+
+	/* Dual IFE: then the other stripe's chain, up to what still streams */
+	subdev = video_extra_source(video, NULL);
+	from = &vdev->entity;
+	while (subdev && subdev->s_stream_enabled) {
+		entity = &subdev->entity;
+		if (video_entity_shared(entity, from))
+			break;
+		v4l2_subdev_call(subdev, video, s_stream, 0);
+		pad = media_pad_remote_pad_first(&entity->pads[0]);
+		if (!(entity->pads[0].flags & MEDIA_PAD_FL_SINK) || !pad ||
+		    !is_media_entity_v4l2_subdev(pad->entity))
+			break;
+		from = entity;
+		subdev = media_entity_to_v4l2_subdev(pad->entity);
 	}
 
 	video_device_pipeline_stop(vdev);
@@ -481,7 +674,7 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 						  1, 65528);
 			sizeimage[i] = clamp_t(u32, p->sizeimage,
 					       bytesperline[i],
-					       bytesperline[i] * CAMSS_FRAME_MAX_HEIGHT_PIX);
+					       bytesperline[i] * CAMSS_FRAME_MAX_LINES_PIX);
 		}
 
 	for (j = 0; j < video->nformats; j++)
@@ -502,7 +695,9 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 
 	pix_mp->pixelformat = fi->pixelformat;
 	pix_mp->width = clamp_t(u32, width, 1, CAMSS_FRAME_MAX_WIDTH);
-	pix_mp->height = clamp_t(u32, height, 1, CAMSS_FRAME_MAX_HEIGHT_RDI);
+	/* A line based plane holds at most CAMSS_FRAME_MAX_LINES_PIX lines */
+	pix_mp->height = clamp_t(u32, height, 1, video->line_based ?
+				 CAMSS_FRAME_MAX_HEIGHT_PIX : CAMSS_FRAME_MAX_HEIGHT_RDI);
 	pix_mp->num_planes = fi->planes;
 	for (i = 0; i < pix_mp->num_planes; i++) {
 		bpl = pix_mp->width / fi->hsub[i].numerator *
@@ -528,7 +723,7 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 						  1, 65528);
 			p->sizeimage = clamp_t(u32, p->sizeimage,
 					       p->bytesperline,
-					       p->bytesperline * CAMSS_FRAME_MAX_HEIGHT_PIX);
+					       p->bytesperline * CAMSS_FRAME_MAX_LINES_PIX);
 			lines = p->sizeimage / p->bytesperline;
 
 			if (p->bytesperline < bytesperline[i])

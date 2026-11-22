@@ -23,6 +23,8 @@
 #define MSM_CSID_PADS_NUM 5
 
 #define MSM_CSID_PAD_SRC (MSM_CSID_PAD_FIRST_SRC)
+/* Source pad of the IPP on a full CSID with a pixel path (port 3) */
+#define MSM_CSID_PAD_IPP (MSM_CSID_PAD_FIRST_SRC + 3)
 
 /* CSID hardware can demultiplex up to 4 outputs */
 #define MSM_CSID_MAX_SRC_STREAMS	4
@@ -141,6 +143,8 @@ struct csid_hw_ops {
 
 struct csid_subdev_resources {
 	bool is_lite;
+	/* Full CSID whose source port 3 is the IPP feeding the VFE pixel path */
+	bool has_ipp;
 	const struct csid_hw_ops *hw_ops;
 	const struct parent_dev_ops *parent_dev_ops;
 	const struct csid_formats *formats;
@@ -164,6 +168,18 @@ struct csid_device {
 	bool tpg_linked;
 	struct csid_phy_config phy;
 	struct v4l2_mbus_framefmt fmt[MSM_CSID_PADS_NUM];
+	/* Crop of the IPP output within the sink format (active format only) */
+	struct v4l2_rect ipp_crop;
+	/* Dual IFE: this IPP starts and stops with the one of another CSID */
+	enum { CSID_IPP_SYNC_NONE, CSID_IPP_SYNC_MASTER, CSID_IPP_SYNC_SLAVE } ipp_sync;
+	u8 ipp_master;		/* slave: the master CSID */
+	/* Error interrupts since the stream start */
+	struct {
+		u32 count;
+		u64 window;	/* start of the current storm window */
+		u32 window_count;
+		bool off;	/* turned off after a storm */
+	} errors;
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *testgen_mode;
 	const struct csid_subdev_resources *res;
@@ -247,5 +263,9 @@ u32 csid_hw_version(struct csid_device *csid);
  */
 u32 csid_src_pad_code(struct csid_device *csid, u32 sink_code,
 		      unsigned int match_format_idx, u32 match_code);
+
+bool csid_port_running(struct csid_device *csid, u8 port);
+void csid_frame_error(struct csid_device *csid, u8 port);
+void csid_fatal_error(struct csid_device *csid, u8 port);
 
 #endif /* QC_MSM_CAMSS_CSID_H */

@@ -728,7 +728,7 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
 		ret = csid->res->hw_ops->reset(csid);
 		if (ret < 0) {
 			disable_irq(csid->irq);
-			camss_disable_clocks(csid->nclocks, csid->clock);
+			camss_disable_clocks(csid->nclocks, csid->clock, csid->camss->dev);
 			regulator_bulk_disable(csid->num_supplies,
 					       csid->supplies);
 			pm_runtime_put_sync(dev);
@@ -738,7 +738,7 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
 		csid->res->hw_ops->hw_version(csid);
 	} else {
 		disable_irq(csid->irq);
-		camss_disable_clocks(csid->nclocks, csid->clock);
+		camss_disable_clocks(csid->nclocks, csid->clock, csid->camss->dev);
 		regulator_bulk_disable(csid->num_supplies,
 				       csid->supplies);
 		pm_runtime_put_sync(dev);
@@ -757,6 +757,89 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
  *
  * Return 0 on success or a negative error code otherwise
  */
+/*
+ * csid_frame_error - A port of the CSID received a corrupt frame
+ * @csid: CSID device
+ * @port: source port
+ *
+ * The VFE line it feeds marks the buffer of that frame. Interrupt context;
+ * the links do not change while streaming.
+ */
+/*
+ * csid_port_running - Whether the VFE line a source port feeds takes frames.
+ * Interrupt context; the links do not change while streaming.
+ */
+bool csid_port_running(struct csid_device *csid, u8 port)
+{
+	struct media_pad *pad;
+
+	pad = media_pad_remote_pad_first(&csid->pads[MSM_CSID_PAD_FIRST_SRC + port]);
+	if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+		return false;
+	return vfe_line_running(v4l2_get_subdevdata(media_entity_to_v4l2_subdev(pad->entity)));
+}
+
+void csid_frame_error(struct csid_device *csid, u8 port)
+{
+	struct media_pad *pad;
+
+	pad = media_pad_remote_pad_first(&csid->pads[MSM_CSID_PAD_FIRST_SRC + port]);
+	if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+		return;
+	vfe_line_frame_error(v4l2_get_subdevdata(media_entity_to_v4l2_subdev(pad->entity)));
+}
+
+/*
+ * csid_fatal_error - A port of the CSID stopped delivering frames
+ * @csid: CSID device
+ * @port: source port
+ *
+ * The streams of the VFE line it feeds must restart. Interrupt context.
+ */
+void csid_fatal_error(struct csid_device *csid, u8 port)
+{
+	struct media_pad *pad;
+
+	pad = media_pad_remote_pad_first(&csid->pads[MSM_CSID_PAD_FIRST_SRC + port]);
+	if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+		return;
+	vfe_line_fatal_error(v4l2_get_subdevdata(media_entity_to_v4l2_subdev(pad->entity)));
+}
+
+/*
+ * Dual IFE: the CSIDs feeding the two pixel paths of a VFE pair start and
+ * stop on the same frame boundary, the one of the master VFE driving the
+ * other. The VFEs paired when the slave's pixel path started, before its
+ * CSID.
+ */
+static void csid_ipp_dual_role(struct csid_device *csid)
+{
+	struct media_pad *pad = media_pad_remote_pad_first(&csid->pads[MSM_CSID_PAD_IPP]);
+	struct csid_device *master;
+	struct vfe_device *vfe;
+	struct vfe_line *line;
+
+	csid->ipp_sync = CSID_IPP_SYNC_NONE;
+	if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+		return;
+
+	line = v4l2_get_subdevdata(media_entity_to_v4l2_subdev(pad->entity));
+	vfe = to_vfe(line);
+	if (!vfe->dual.peer)
+		return;
+	if (vfe->dual.master) {
+		csid->ipp_sync = CSID_IPP_SYNC_MASTER;
+		return;
+	}
+
+	pad = media_pad_remote_pad_first(&vfe->dual.peer->line[VFE_LINE_PIX].pads[MSM_VFE_PAD_SINK]);
+	if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+		return;
+	master = v4l2_get_subdevdata(media_entity_to_v4l2_subdev(pad->entity));
+	csid->ipp_master = master->id;
+	csid->ipp_sync = CSID_IPP_SYNC_SLAVE;
+}
+
 static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct csid_device *csid = v4l2_get_subdevdata(sd);
@@ -776,6 +859,9 @@ static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 		    !media_pad_remote_pad_first(&csid->pads[MSM_CSID_PAD_SINK]))
 			return -ENOLINK;
 	}
+
+	if (enable && csid->res->has_ipp)
+		csid_ipp_dual_role(csid);
 
 	if (csid->phy.need_vc_update) {
 		csid->res->hw_ops->configure_stream(csid, enable);
@@ -868,6 +954,18 @@ static void csid_try_format(struct csid_device *csid,
 			fmt->height = clamp_t(u32, fmt->height, 1, 8191);
 
 			fmt->field = V4L2_FIELD_NONE;
+		}
+		break;
+
+	case MSM_CSID_PAD_IPP:
+		if (!csid->res->has_ipp)
+			break;
+
+		/* The IPP passes the sink format, cropped */
+		*fmt = *__csid_get_format(csid, sd_state, MSM_CSID_PAD_SINK, which);
+		if (which == V4L2_SUBDEV_FORMAT_ACTIVE && csid->ipp_crop.width) {
+			fmt->width = csid->ipp_crop.width;
+			fmt->height = csid->ipp_crop.height;
 		}
 		break;
 	}
@@ -1003,6 +1101,10 @@ static int csid_set_format(struct v4l2_subdev *sd,
 
 	/* Propagate the format from sink to source pads */
 	if (fmt->pad == MSM_CSID_PAD_SINK) {
+		/* A new sink format resets the IPP crop to the whole frame */
+		if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+			csid->ipp_crop = (struct v4l2_rect){ 0, 0, fmt->format.width,
+							     fmt->format.height };
 		for (i = MSM_CSID_PAD_FIRST_SRC; i < MSM_CSID_PADS_NUM; ++i) {
 			format = __csid_get_format(csid, sd_state, i, fmt->which);
 
@@ -1325,11 +1427,67 @@ static const struct v4l2_subdev_video_ops csid_video_ops = {
 	.s_stream = csid_set_stream,
 };
 
+/*
+ * The IPP of a full CSID can crop its output. Only the active configuration
+ * is kept: the crop is programmed at stream start.
+ */
+static int csid_get_selection(struct v4l2_subdev *sd,
+			      struct v4l2_subdev_state *sd_state,
+			      struct v4l2_subdev_selection *sel)
+{
+	struct csid_device *csid = v4l2_get_subdevdata(sd);
+	const struct v4l2_mbus_framefmt *sink = &csid->fmt[MSM_CSID_PAD_SINK];
+
+	if (!csid->res->has_ipp || sel->pad != MSM_CSID_PAD_IPP ||
+	    sel->which != V4L2_SUBDEV_FORMAT_ACTIVE)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		sel->r = (struct v4l2_rect){ 0, 0, sink->width, sink->height };
+		return 0;
+	case V4L2_SEL_TGT_CROP:
+		sel->r = csid->ipp_crop;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int csid_set_selection(struct v4l2_subdev *sd,
+			      struct v4l2_subdev_state *sd_state,
+			      struct v4l2_subdev_selection *sel)
+{
+	struct csid_device *csid = v4l2_get_subdevdata(sd);
+	const struct v4l2_mbus_framefmt *sink = &csid->fmt[MSM_CSID_PAD_SINK];
+	struct v4l2_rect *r = &sel->r;
+
+	if (!csid->res->has_ipp || sel->pad != MSM_CSID_PAD_IPP ||
+	    sel->which != V4L2_SUBDEV_FORMAT_ACTIVE ||
+	    sel->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
+
+	/* Even offsets and sizes keep the Bayer order */
+	r->left = clamp_t(s32, r->left, 0, sink->width - 2) & ~1;
+	r->top = clamp_t(s32, r->top, 0, sink->height - 2) & ~1;
+	r->width = clamp_t(u32, r->width, 2, sink->width - r->left) & ~1;
+	r->height = clamp_t(u32, r->height, 2, sink->height - r->top) & ~1;
+
+	csid->ipp_crop = *r;
+	csid->fmt[MSM_CSID_PAD_IPP].width = r->width;
+	csid->fmt[MSM_CSID_PAD_IPP].height = r->height;
+
+	return 0;
+}
+
 static const struct v4l2_subdev_pad_ops csid_pad_ops = {
 	.enum_mbus_code = csid_enum_mbus_code,
 	.enum_frame_size = csid_enum_frame_size,
 	.get_fmt = csid_get_format,
 	.set_fmt = csid_set_format,
+	.get_selection = csid_get_selection,
+	.set_selection = csid_set_selection,
 };
 
 static const struct v4l2_subdev_ops csid_v4l2_ops = {

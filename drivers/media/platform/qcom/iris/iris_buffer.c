@@ -261,7 +261,8 @@ static u32 iris_yuv_buffer_size_qc08c(struct iris_inst *inst)
 	uv_plane = ALIGN(uv_stride * ALIGN(f->fmt.pix_mp.height / 2, UV_SCANLINE_ALIGN_QC08C),
 			 PIXELS_4K);
 
-	return ALIGN(y_meta_plane + y_plane + uv_meta_plane + uv_plane, PIXELS_4K);
+	return ALIGN(y_meta_plane + y_plane + uv_meta_plane + uv_plane +
+		     max_t(u32, SZ_16K, y_stride * 48), PIXELS_4K);
 }
 
 /*
@@ -722,12 +723,9 @@ static int iris_destroy_internal_buffers(struct iris_inst *inst, u32 plane, bool
 	for (i = 0; i < len; i++) {
 		buffers = &inst->buffers[internal_buf_type[i]];
 		list_for_each_entry_safe(buf, next, &buffers->list, list) {
-			/*
-			 * during stream on, skip destroying internal(DPB) buffer
-			 * if firmware did not return it.
-			 * during close, destroy all buffers irrespectively.
-			 */
-			if (!force && buf->attr & BUF_ATTR_QUEUED)
+			if (!force && (buf->attr & BUF_ATTR_QUEUED ||
+			    (buf->type == BUF_DPB &&
+			     buf->attr & BUF_ATTR_PENDING_RELEASE)))
 				continue;
 
 			ret = iris_destroy_internal_buffer(inst, buf);
@@ -956,6 +954,11 @@ int iris_vb2_buffer_done(struct iris_inst *inst, struct iris_buffer *buf)
 		return -EINVAL;
 
 	vb2 = &vbuf->vb2_buf;
+	/* Failed start_streaming() must return driver-owned buffers as queued. */
+	if (!vb2->vb2_queue->streaming && inst->state == IRIS_INST_ERROR) {
+		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_QUEUED);
+		return 0;
+	}
 
 	vbuf->flags |= buf->flags;
 

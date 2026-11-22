@@ -7,6 +7,7 @@
 
 #include <linux/types.h>
 #include <linux/clk.h>
+#include <linux/clk/clk-conf.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
@@ -17,6 +18,7 @@
 #include <linux/string_choices.h>
 
 #include <drm/display/drm_dp_helper.h>
+#include <drm/display/drm_dsc_helper.h>
 #include <drm/drm_device.h>
 #include <drm/drm_fixed.h>
 #include <drm/drm_print.h>
@@ -41,7 +43,7 @@
 	DP_INTR_WRONG_ADDR | DP_INTR_TIMEOUT | \
 	DP_INTR_NACK_DEFER | DP_INTR_WRONG_DATA_CNT | \
 	DP_INTR_I2C_NACK | DP_INTR_I2C_DEFER | \
-	DP_INTR_PLL_UNLOCKED | DP_INTR_AUX_ERROR)
+	DP_INTR_AUX_ERROR)
 
 #define DP_INTERRUPT_STATUS1_ACK \
 	(DP_INTERRUPT_STATUS1 << DP_INTERRUPT_STATUS_ACK_SHIFT)
@@ -137,9 +139,11 @@ struct msm_dp_ctrl_private {
 
 	u32 hw_revision;
 
+	bool phy_powered;
 	bool core_clks_on;
 	bool link_clks_on;
 	bool stream_clks_on;
+	bool clk_defaults_set;
 };
 
 static inline u32 msm_dp_read_ahb(const struct msm_dp_ctrl_private *ctrl, u32 offset)
@@ -392,6 +396,12 @@ static void msm_dp_ctrl_config_ctrl(struct msm_dp_ctrl_private *ctrl)
 {
 	u32 config = 0, tbd;
 	const u8 *dpcd = ctrl->panel->dpcd;
+	/*
+	 * DSC leaves source bpc in MISC/PPS, but the DP controller's mainlink
+	 * packetizer carries a compressed byte stream and expects 8bpc here.
+	 */
+	u32 bpp = msm_dp_panel_dsc_enabled(ctrl->panel) ? 24 :
+		  ctrl->panel->msm_dp_mode.bpp;
 
 	/* Default-> LSCLK DIV: 1/4 LCLK  */
 	config |= (2 << DP_CONFIGURATION_CTRL_LSCLK_DIV_SHIFT);
@@ -403,8 +413,7 @@ static void msm_dp_ctrl_config_ctrl(struct msm_dp_ctrl_private *ctrl)
 	if (drm_dp_alternate_scrambler_reset_cap(dpcd))
 		config |= DP_CONFIGURATION_CTRL_ASSR;
 
-	tbd = msm_dp_link_get_test_bits_depth(ctrl->link,
-			ctrl->panel->msm_dp_mode.bpp);
+	tbd = msm_dp_link_get_test_bits_depth(ctrl->link, bpp);
 
 	config |= tbd << DP_CONFIGURATION_CTRL_BPC_SHIFT;
 
@@ -446,13 +455,14 @@ static void msm_dp_ctrl_lane_mapping(struct msm_dp_ctrl_private *ctrl)
 static void msm_dp_ctrl_configure_source_params(struct msm_dp_ctrl_private *ctrl)
 {
 	u32 colorimetry_cfg, test_bits_depth, misc_val;
+	u32 bpp = ctrl->panel->msm_dp_mode.bpp;
 
 	msm_dp_ctrl_lane_mapping(ctrl);
 	msm_dp_setup_peripheral_flush(ctrl);
 
 	msm_dp_ctrl_config_ctrl(ctrl);
 
-	test_bits_depth = msm_dp_link_get_test_bits_depth(ctrl->link, ctrl->panel->msm_dp_mode.bpp);
+	test_bits_depth = msm_dp_link_get_test_bits_depth(ctrl->link, bpp);
 	colorimetry_cfg = msm_dp_link_get_colorimetry_config(ctrl->link);
 
 	misc_val = msm_dp_read_link(ctrl, REG_DP_MISC1_MISC0);
@@ -650,6 +660,8 @@ static void msm_dp_panel_update_tu_timings(struct msm_dp_tu_calc_input *in,
 
 	if (!in->dsc_en)
 		goto fec_check;
+
+	tu->bpp = 24;
 
 	temp1_fp = drm_fixp_from_fraction(in->compress_ratio, 100);
 	temp2_fp = drm_fixp_from_fraction(in->bpp, 1);
@@ -1241,6 +1253,7 @@ static void msm_dp_ctrl_calc_tu_parameters(struct msm_dp_ctrl_private *ctrl,
 {
 	struct msm_dp_tu_calc_input in;
 	struct drm_display_mode *drm_mode;
+	struct drm_dsc_config *dsc = msm_dp_panel_get_dsc_config(ctrl->panel);
 
 	drm_mode = &ctrl->panel->msm_dp_mode.drm_mode;
 
@@ -1251,11 +1264,13 @@ static void msm_dp_ctrl_calc_tu_parameters(struct msm_dp_ctrl_private *ctrl,
 	in.nlanes = ctrl->link->link_params.num_lanes;
 	in.bpp = ctrl->panel->msm_dp_mode.bpp;
 	in.pixel_enc = ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420 ? 420 : 444;
-	in.dsc_en = 0;
+	in.dsc_en = dsc ? 1 : 0;
 	in.async_en = 0;
-	in.fec_en = 0;
-	in.num_of_dsc_slices = 0;
-	in.compress_ratio = 100;
+	in.fec_en = msm_dp_panel_fec_enabled(ctrl->panel);
+	in.num_of_dsc_slices = dsc ? dsc->slice_count : 0;
+	in.compress_ratio = dsc ?
+		mult_frac(100, ctrl->panel->msm_dp_mode.bpp,
+			  drm_dsc_get_bpp_int(dsc)) : 100;
 
 	_dp_ctrl_calc_tu(ctrl, &in, tu_table);
 }
@@ -1411,7 +1426,8 @@ static int msm_dp_ctrl_set_pattern_state_bit(struct msm_dp_ctrl_private *ctrl,
 				 data, data & bit,
 				 POLLING_SLEEP_US, POLLING_TIMEOUT_US);
 	if (ret < 0) {
-		DRM_ERROR("set state_bit for link_train=%d failed\n", state_bit);
+		drm_dbg_dp(ctrl->drm_dev,
+			   "set state_bit for link_train=%d failed\n", state_bit);
 		return ret;
 	}
 
@@ -1603,14 +1619,16 @@ static int msm_dp_ctrl_link_train_1_2(struct msm_dp_ctrl_private *ctrl,
 
 	ret = msm_dp_ctrl_link_train_1(ctrl, training_step, dp_phy);
 	if (ret) {
-		DRM_ERROR("link training #1 on phy %d failed. ret=%d\n", dp_phy, ret);
+		drm_dbg_dp(ctrl->drm_dev,
+			   "link training #1 on phy %d failed. ret=%d\n", dp_phy, ret);
 		return ret;
 	}
 	drm_dbg_dp(ctrl->drm_dev, "link training #1 on phy %d successful\n", dp_phy);
 
 	ret = msm_dp_ctrl_link_train_2(ctrl, training_step, dp_phy);
 	if (ret) {
-		DRM_ERROR("link training #2 on phy %d failed. ret=%d\n", dp_phy, ret);
+		drm_dbg_dp(ctrl->drm_dev,
+			   "link training #2 on phy %d failed. ret=%d\n", dp_phy, ret);
 		return ret;
 	}
 	drm_dbg_dp(ctrl->drm_dev, "link training #2 on phy %d successful\n", dp_phy);
@@ -1665,7 +1683,8 @@ static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
 
 	ret = msm_dp_ctrl_link_train_1_2(ctrl, training_step, DP_PHY_DPRX);
 	if (ret) {
-		DRM_ERROR("link training on sink failed. ret=%d\n", ret);
+		drm_dbg_dp(ctrl->drm_dev,
+			   "link training on sink failed. ret=%d\n", ret);
 		goto end;
 	}
 
@@ -1673,6 +1692,89 @@ end:
 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, 0);
 
 	return ret;
+}
+
+static void msm_dp_ctrl_fec_config(struct msm_dp_ctrl_private *ctrl, bool enable)
+{
+	u32 val;
+
+	val = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
+
+	if (enable) {
+		val &= ~DP_MAINLINK_CTRL_FLUSH_MODE_MASK;
+		val |= DP_MAINLINK_CTRL_FEC_EN |
+		       DP_MAINLINK_CTRL_FEC_SEQ_MODE |
+		       DP_MAINLINK_FLUSH_MODE_SDE_PERIPH_UPDATE |
+		       DP_MAINLINK_FB_BOUNDARY_SEL;
+	} else {
+		val &= ~(DP_MAINLINK_CTRL_FEC_EN |
+			 DP_MAINLINK_CTRL_FEC_SEQ_MODE);
+	}
+
+	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, val);
+	/* Make sure FEC control is programmed before touching the sink. */
+	wmb();
+}
+
+static void msm_dp_ctrl_sink_fec_config(struct msm_dp_ctrl_private *ctrl, bool enable)
+{
+	u8 config = enable ? DP_FEC_READY | DP_FEC_BIT_ERROR_COUNT : 0;
+	int ret;
+
+	if (!msm_dp_panel_fec_enabled(ctrl->panel))
+		return;
+
+	ret = drm_dp_dpcd_writeb(ctrl->aux, DP_FEC_CONFIGURATION, config);
+	if (ret < 1)
+		DRM_ERROR("failed to %s sink FEC\n", str_enable_disable(enable));
+	else
+		drm_dbg_dp(ctrl->drm_dev, "sink FEC %s\n", str_enabled_disabled(enable));
+}
+
+static void msm_dp_ctrl_host_fec_start(struct msm_dp_ctrl_private *ctrl)
+{
+	u8 fec_status = 0;
+	int i, ret;
+
+	if (!msm_dp_panel_fec_enabled(ctrl->panel))
+		return;
+
+	for (i = 0; i < 3; i++) {
+		msm_dp_ctrl_fec_config(ctrl, true);
+		usleep_range(900, 1000);
+
+		ret = drm_dp_dpcd_readb(ctrl->aux, DP_FEC_STATUS, &fec_status);
+		if (ret == 1 && (fec_status & DP_FEC_DECODE_EN_DETECTED)) {
+			drm_dbg_dp(ctrl->drm_dev, "sink FEC detected, status=0x%x\n",
+				   fec_status);
+			return;
+		}
+	}
+
+	DRM_ERROR("failed to enable sink FEC\n");
+}
+
+static void msm_dp_ctrl_host_fec_stop(struct msm_dp_ctrl_private *ctrl)
+{
+	if (!msm_dp_panel_fec_enabled(ctrl->panel))
+		return;
+
+	msm_dp_ctrl_fec_config(ctrl, false);
+}
+
+static void msm_dp_ctrl_sink_dsc_enable(struct msm_dp_ctrl_private *ctrl, bool enable)
+{
+	u8 dsc_enable = enable ? DP_DECOMPRESSION_EN : 0;
+	int ret;
+
+	if (!msm_dp_panel_fec_enabled(ctrl->panel))
+		return;
+
+	ret = drm_dp_dpcd_writeb(ctrl->aux, DP_DSC_ENABLE, dsc_enable);
+	if (ret < 1)
+		DRM_ERROR("failed to %s sink DSC\n", str_enable_disable(enable));
+	else
+		drm_dbg_dp(ctrl->drm_dev, "sink DSC %s\n", str_enabled_disabled(enable));
 }
 
 static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
@@ -1689,7 +1791,19 @@ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
 	 * As part of previous calls, DP controller state might have
 	 * transitioned to PUSH_IDLE. In order to start transmitting
 	 * a link training pattern, we have to first do soft reset.
+	 *
+	 * The comment above has always asked for a soft reset here, but
+	 * only msm_dp_ctrl_mainlink_enable()'s MAINLINK_CTRL reset bit was
+	 * being touched (no SW_RESET). On a quick unplug/replug the
+	 * controller mainlink state machine keeps MAINLINK_READY_FOR_VIDEO
+	 * set from the previous session, so LINK_TRAINING never asserts and
+	 * every high-rate training attempt fails with -ETIMEDOUT (observed
+	 * on SC8280XP: 8.1G/5.4G/2.7G all fail, link downshifts to RBR
+	 * 1.62G). A full SW_RESET clears the stale state machine.
 	 */
+	msm_dp_ctrl_reset(&ctrl->msm_dp_ctrl);
+
+	msm_dp_ctrl_sink_fec_config(ctrl, true);
 
 	ret = msm_dp_ctrl_link_train(ctrl, training_step);
 
@@ -1801,7 +1915,22 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl)
 	ctrl->phy_opts.dp.ssc = drm_dp_max_downspread(dpcd);
 
 	phy_configure(phy, &ctrl->phy_opts);
-	phy_power_on(phy);
+
+	ret = phy_power_on(phy);
+	if (ret) {
+		DRM_ERROR("failed to power on phy, ret=%d\n", ret);
+		return ret;
+	}
+
+	ctrl->phy_powered = true;
+
+	if (!ctrl->clk_defaults_set) {
+		ret = of_clk_set_defaults(ctrl->dev->of_node, false);
+		if (ret)
+			return ret;
+
+		ctrl->clk_defaults_set = true;
+	}
 
 	dev_pm_opp_set_rate(ctrl->dev, ctrl->link->link_params.rate * 1000);
 	ret = msm_dp_ctrl_link_clk_enable(&ctrl->msm_dp_ctrl);
@@ -1928,6 +2057,9 @@ void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
 
 	msm_dp_ctrl_phy_reset(ctrl);
 	phy_init(phy);
+
+	drm_dbg_dp(ctrl->drm_dev, "phy=%p init=%d power_on=%d\n",
+			phy, phy->init_count, phy->power_count);
 }
 
 void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)
@@ -1939,7 +2071,21 @@ void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)
 	phy = ctrl->phy;
 
 	msm_dp_ctrl_phy_reset(ctrl);
+
+	/*
+	 * Every other caller powers the phy off before taking it down. Doing it
+	 * here too keeps the phy core from carrying a power count for hardware
+	 * that is gone, which it would act on the next time the phy is brought
+	 * up by powering on registers this exit has already unclocked.
+	 */
+	if (ctrl->phy_powered) {
+		phy_power_off(phy);
+		ctrl->phy_powered = false;
+	}
+
 	phy_exit(phy);
+	drm_dbg_dp(ctrl->drm_dev, "phy=%p init=%d power_on=%d\n",
+			phy, phy->init_count, phy->power_count);
 }
 
 static int msm_dp_ctrl_reinitialize_mainlink(struct msm_dp_ctrl_private *ctrl)
@@ -1959,6 +2105,7 @@ static int msm_dp_ctrl_reinitialize_mainlink(struct msm_dp_ctrl_private *ctrl)
 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
 
 	phy_power_off(phy);
+	ctrl->phy_powered = false;
 	/* hw recommended delay before re-enabling clocks */
 	msleep(20);
 
@@ -1984,11 +2131,14 @@ static int msm_dp_ctrl_deinitialize_mainlink(struct msm_dp_ctrl_private *ctrl)
 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
 
 	phy_power_off(phy);
+	ctrl->phy_powered = false;
 
 	/* aux channel down, reinit phy */
 	phy_exit(phy);
 	phy_init(phy);
 
+	drm_dbg_dp(ctrl->drm_dev, "phy=%p init=%d power_on=%d\n",
+			phy, phy->init_count, phy->power_count);
 	return 0;
 }
 
@@ -2013,6 +2163,24 @@ static int msm_dp_ctrl_link_maintenance(struct msm_dp_ctrl_private *ctrl)
 	ret = msm_dp_ctrl_wait4video_ready(ctrl);
 end:
 	return ret;
+}
+
+int msm_dp_ctrl_retrain_link(struct msm_dp_ctrl *msm_dp_ctrl)
+{
+	struct msm_dp_ctrl_private *ctrl;
+	u8 link_status[DP_LINK_STATUS_SIZE];
+
+	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+
+	if (!ctrl->link_clks_on)
+		return -EINVAL;
+
+	/* a racing modeset may have retrained the link already */
+	if (drm_dp_dpcd_read_link_status(ctrl->aux, link_status) >= 0 &&
+	    drm_dp_channel_eq_ok(link_status, ctrl->link->link_params.num_lanes))
+		return 0;
+
+	return msm_dp_ctrl_link_maintenance(ctrl);
 }
 
 #define SCRAMBLER_RESET_COUNT_VALUE		0xFC
@@ -2209,6 +2377,18 @@ void msm_dp_ctrl_handle_sink_request(struct msm_dp_ctrl *msm_dp_ctrl)
 
 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
 	sink_request = ctrl->link->sink_request;
+
+	if (sink_request & (DP_TEST_LINK_PHY_TEST_PATTERN |
+			    DP_LINK_STATUS_UPDATED |
+			    DP_TEST_LINK_TRAINING)) {
+		if (!ctrl->link_clks_on || !ctrl->stream_clks_on) {
+			drm_dbg_dp(ctrl->drm_dev,
+				   "skip sink request %#x with link_clks=%d stream_clks=%d\n",
+				   sink_request, ctrl->link_clks_on,
+				   ctrl->stream_clks_on);
+			return;
+		}
+	}
 
 	if (sink_request & DP_TEST_LINK_PHY_TEST_PATTERN) {
 		drm_dbg_dp(ctrl->drm_dev, "PHY_TEST_PATTERN request\n");
@@ -2478,7 +2658,9 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
 
 	pixel_rate = pixel_rate_orig = ctrl->panel->msm_dp_mode.drm_mode.clock;
 
-	if (msm_dp_ctrl->wide_bus_en || ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420)
+	if (msm_dp_ctrl->wide_bus_en ||
+	    ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420 ||
+	    msm_dp_panel_dsc_enabled(ctrl->panel))
 		pixel_rate >>= 1;
 
 	drm_dbg_dp(ctrl->drm_dev, "rate=%d, num_lanes=%d, pixel_rate=%lu\n",
@@ -2533,7 +2715,10 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
 		pixel_rate_orig,
 		ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420);
 
-	msm_dp_panel_clear_dsc_dto(ctrl->panel);
+	if (msm_dp_panel_dsc_enabled(ctrl->panel))
+		msm_dp_panel_config_dsc(ctrl->panel, true);
+	else
+		msm_dp_panel_clear_dsc_dto(ctrl->panel);
 
 	msm_dp_ctrl_setup_tr_unit(ctrl);
 
@@ -2546,6 +2731,11 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
 	mainlink_ready = msm_dp_ctrl_mainlink_ready(ctrl);
 	drm_dbg_dp(ctrl->drm_dev,
 		"mainlink %s\n", mainlink_ready ? "READY" : "NOT READY");
+
+	if (mainlink_ready && msm_dp_panel_dsc_enabled(ctrl->panel)) {
+		msm_dp_ctrl_host_fec_start(ctrl);
+		msm_dp_ctrl_sink_dsc_enable(ctrl, true);
+	}
 
 end:
 	return ret;
@@ -2560,6 +2750,12 @@ void msm_dp_ctrl_off_link_stream(struct msm_dp_ctrl *msm_dp_ctrl)
 	phy = ctrl->phy;
 
 	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
+	msm_dp_panel_disable_hdr_sdp(ctrl->panel);
+
+	if (msm_dp_panel_dsc_enabled(ctrl->panel)) {
+		msm_dp_ctrl_host_fec_stop(ctrl);
+		msm_dp_panel_config_dsc(ctrl->panel, false);
+	}
 
 	/* set dongle to D3 (power off) mode */
 	msm_dp_link_psm_config(ctrl->link, &ctrl->panel->link_info, true);
@@ -2571,14 +2767,16 @@ void msm_dp_ctrl_off_link_stream(struct msm_dp_ctrl *msm_dp_ctrl)
 		ctrl->stream_clks_on = false;
 	}
 
-	dev_pm_opp_set_rate(ctrl->dev, 0);
 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
 
 	phy_power_off(phy);
+	ctrl->phy_powered = false;
 
 	/* aux channel down, reinit phy */
 	phy_exit(phy);
 	phy_init(phy);
+	drm_dbg_dp(ctrl->drm_dev, "phy=%p init=%d power_on=%d\n",
+			phy, phy->init_count, phy->power_count);
 }
 
 void msm_dp_ctrl_off(struct msm_dp_ctrl *msm_dp_ctrl)
@@ -2590,6 +2788,14 @@ void msm_dp_ctrl_off(struct msm_dp_ctrl *msm_dp_ctrl)
 	phy = ctrl->phy;
 
 	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
+	msm_dp_panel_disable_hdr_sdp(ctrl->panel);
+
+	if (msm_dp_panel_dsc_enabled(ctrl->panel)) {
+		msm_dp_ctrl_sink_dsc_enable(ctrl, false);
+		msm_dp_ctrl_sink_fec_config(ctrl, false);
+		msm_dp_ctrl_host_fec_stop(ctrl);
+		msm_dp_panel_config_dsc(ctrl->panel, false);
+	}
 
 	msm_dp_ctrl_mainlink_disable(ctrl);
 
@@ -2603,6 +2809,9 @@ void msm_dp_ctrl_off(struct msm_dp_ctrl *msm_dp_ctrl)
 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
 
 	phy_power_off(phy);
+	ctrl->phy_powered = false;
+	drm_dbg_dp(ctrl->drm_dev, "phy=%p init=%d power_on=%d\n",
+			phy, phy->init_count, phy->power_count);
 }
 
 irqreturn_t msm_dp_ctrl_isr(struct msm_dp_ctrl *msm_dp_ctrl)

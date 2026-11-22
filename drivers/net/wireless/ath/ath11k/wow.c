@@ -677,12 +677,6 @@ static int ath11k_wow_set_keepalive(struct ath11k *ar,
 	return 0;
 }
 
-/*
- * The firmware crashed during the system suspend, and the device is reset
- * once the system has resumed (see ath11k_core_schedule_reset()). Suspending
- * without WoW instead would have mac80211 stop the device, and starting it
- * again on resume fails. So only quiesce the device and report WoW as set.
- */
 static void ath11k_wow_suspend_crashed(struct ath11k *ar)
 {
 	struct ath11k_base *ab = ar->ab;
@@ -691,17 +685,12 @@ static void ath11k_wow_suspend_crashed(struct ath11k *ar)
 	ath11k_ce_stop_shadow_timers(ab);
 	ath11k_dp_stop_shadow_timers(ab);
 
-	/* They are off already if the suspend failed at ath11k_hif_suspend(). */
 	if (test_bit(ATH11K_FLAG_EXT_IRQ_ENABLED, &ab->dev_flags))
 		ath11k_hif_irq_disable(ab);
 	if (test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags))
 		ath11k_hif_ce_irq_disable(ab);
 }
 
-/*
- * The reset disables the interrupts and the restart enables them again, so
- * it needs them enabled to start with: undo the suspend's disabling.
- */
 static void ath11k_wow_resume_crashed(struct ath11k *ar)
 {
 	struct ath11k_base *ab = ar->ab;
@@ -712,25 +701,25 @@ static void ath11k_wow_resume_crashed(struct ath11k *ar)
 		ath11k_hif_irq_enable(ab);
 }
 
-/*
- * Undo what ath11k_wow_op_suspend() sets up before ath11k_wow_enable(), for
- * a device that stays up after all.
- */
-static void ath11k_wow_undo_setup(struct ath11k *ar)
+static bool ath11k_wow_rings_ready(struct ath11k_base *ab)
 {
-	ath11k_wow_nlo_cleanup(ar);
-	ath11k_wow_clear_hw_filter(ar);
-	ath11k_wow_protocol_offload(ar, false);
-	ath11k_wow_set_keepalive(ar, WMI_STA_KEEPALIVE_METHOD_NULL_FRAME,
-				 WMI_STA_KEEPALIVE_INTERVAL_DISABLE);
-	ath11k_dp_rx_pktlog_start(ar->ab);
+	bool ready;
+
+	if (!mutex_trylock(&ab->core_lock))
+		return false;
+
+	ready = !test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags) &&
+		ath11k_dp_rx_mon_status_allocated(ab);
+	mutex_unlock(&ab->core_lock);
+
+	return ready;
 }
 
 int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
 			  struct cfg80211_wowlan *wowlan)
 {
 	struct ath11k *ar = hw->priv;
-	bool declined = false;
+	bool rings_ready;
 	int ret;
 
 	ret = ath11k_mac_wait_tx_complete(ar);
@@ -739,14 +728,11 @@ int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
 		return ret;
 	}
 
+	rings_ready = ath11k_wow_rings_ready(ar->ab);
+
 	mutex_lock(&ar->conf_mutex);
 
-	/*
-	 * Crash recovery frees and rebuilds the rings reaped below. Suspend
-	 * without WoW instead: mac80211 then stops the device, and
-	 * ath11k_core_suspend() waits for the recovery.
-	 */
-	if (ar->state != ATH11K_STATE_ON) {
+	if (ar->state != ATH11K_STATE_ON || !rings_ready) {
 		ath11k_warn(ar->ab, "device state %d, suspending without wow\n",
 			    ar->state);
 		ret = -EBUSY;
@@ -839,22 +825,6 @@ exit:
 		ret = 0;
 	}
 
-	if (ret && declined && ++ar->wow.declined <= ATH11K_WOW_DECLINED_MAX) {
-		/*
-		 * Returning 1 makes cfg80211 disconnect and power the device
-		 * down for the whole sleep, which is a high price for a
-		 * firmware that is only busy for the moment. Fail this
-		 * suspend instead; the system tries again shortly.
-		 */
-		ath11k_warn(ar->ab, "firmware declined wow, failing the suspend (%u/%u)\n",
-			    ar->wow.declined, ATH11K_WOW_DECLINED_MAX);
-		ath11k_wow_undo_setup(ar);
-		mutex_unlock(&ar->conf_mutex);
-		return -EBUSY;
-	}
-	/* Suspended, failed for another reason or fell back: start over. */
-	ar->wow.declined = 0;
-
 	mutex_unlock(&ar->conf_mutex);
 	return ret ? 1 : 0;
 }
@@ -875,7 +845,6 @@ int ath11k_wow_op_resume(struct ieee80211_hw *hw)
 
 	mutex_lock(&ar->conf_mutex);
 
-	/* A crashed device is restarted by the reset after resume. */
 	if (test_bit(ATH11K_FLAG_CRASH_PENDING, &ar->ab->dev_flags))
 		goto exit;
 
@@ -928,7 +897,6 @@ int ath11k_wow_op_resume(struct ieee80211_hw *hw)
 	}
 
 exit:
-	/* So is one that crashed during the sleep and was noticed just now. */
 	if (test_bit(ATH11K_FLAG_CRASH_PENDING, &ar->ab->dev_flags)) {
 		ath11k_warn(ar->ab, "firmware crashed, restarting it after resume\n");
 		ath11k_wow_resume_crashed(ar);

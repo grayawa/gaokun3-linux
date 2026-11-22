@@ -22,6 +22,10 @@
 #include "sc8280xp.dtsi"
 #include "sc8280xp-pmics.dtsi"
 
+/delete-node/ &pil_video_mem;
+/delete-node/ &pil_nsp1_mem;
+/delete-node/ &remoteproc_nsp1;
+
 / {
 	chassis-type = "tablet";
 	model = "Matebook E Go";
@@ -203,13 +207,18 @@
 		pinctrl-0 = <&hastings_reg_en>;
 		pinctrl-names = "default";
 
+		/*
+		 * pcie4 disables its vddpe-3v3 whenever the link goes down, and
+		 * the firmware keeps running in L2 with WoWLAN armed.
+		 */
+		regulator-always-on;
 		regulator-boot-on;
 	};
 
 	reserved-memory {
-		gpu_mem: gpu-mem@8bf00000 {
-			reg = <0 0x8bf00000 0 0x2000>;
-			no-map;
+		iris_iova: iris-iova {
+			/* Reserve the address range used by the Gaokun3 video firmware. */
+			iommu-addresses = <&iris 0x0 0x0 0x0 0x25800000>;
 		};
 
 		linux,cma {
@@ -226,27 +235,34 @@
 			reusable;
 			linux,cma-default;
 		};
+
+		/* The Gaokun3 firmware layout places the video image here. */
+		pil_video_mem: video-region@8c600000 {
+			reg = <0 0x8c600000 0 0x700000>;
+			no-map;
+		};
 	};
 
 	thermal-zones {
+		/* First-stage CPU thermal policy; implemented by GPT-6.1-Sol. */
 		cpu0-thermal {
 			polling-delay-passive = <250>;
 
+			trips {
+				gaokun_cpu0_tsens0_passive: passive {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
 			cooling-maps {
 				map0 {
-					trip = <&cpu0_alert0>;
+					trip = <&gaokun_cpu0_tsens0_passive>;
 					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-
-			trips {
-				cpu0_alert0: trip-point0 {
-					temperature = <85000>;
-					hysteresis = <2000>;
-					type = "passive";
 				};
 			};
 		};
@@ -254,21 +270,21 @@
 		cpu1-thermal {
 			polling-delay-passive = <250>;
 
+			trips {
+				gaokun_cpu1_tsens0_passive: passive {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
 			cooling-maps {
 				map0 {
-					trip = <&cpu1_alert0>;
+					trip = <&gaokun_cpu1_tsens0_passive>;
 					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-
-			trips {
-				cpu1_alert0: trip-point0 {
-					temperature = <85000>;
-					hysteresis = <2000>;
-					type = "passive";
 				};
 			};
 		};
@@ -276,21 +292,21 @@
 		cpu2-thermal {
 			polling-delay-passive = <250>;
 
+			trips {
+				gaokun_cpu2_tsens0_passive: passive {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
 			cooling-maps {
 				map0 {
-					trip = <&cpu2_alert0>;
+					trip = <&gaokun_cpu2_tsens0_passive>;
 					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-
-			trips {
-				cpu2_alert0: trip-point0 {
-					temperature = <85000>;
-					hysteresis = <2000>;
-					type = "passive";
 				};
 			};
 		};
@@ -298,21 +314,21 @@
 		cpu3-thermal {
 			polling-delay-passive = <250>;
 
+			trips {
+				gaokun_cpu3_tsens0_passive: passive {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
 			cooling-maps {
 				map0 {
-					trip = <&cpu3_alert0>;
+					trip = <&gaokun_cpu3_tsens0_passive>;
 					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-
-			trips {
-				cpu3_alert0: trip-point0 {
-					temperature = <85000>;
-					hysteresis = <2000>;
-					type = "passive";
 				};
 			};
 		};
@@ -320,21 +336,21 @@
 		cpu4-thermal {
 			polling-delay-passive = <250>;
 
+			trips {
+				gaokun_cpu4_tsens0_passive: passive {
+					temperature = <80000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
 			cooling-maps {
 				map0 {
-					trip = <&cpu4_alert0>;
+					trip = <&gaokun_cpu4_tsens0_passive>;
 					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-
-			trips {
-				cpu4_alert0: trip-point0 {
-					temperature = <85000>;
-					hysteresis = <2000>;
-					type = "passive";
 				};
 			};
 		};
@@ -342,21 +358,21 @@
 		cpu5-thermal {
 			polling-delay-passive = <250>;
 
+			trips {
+				gaokun_cpu5_tsens0_passive: passive {
+					temperature = <80000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
 			cooling-maps {
 				map0 {
-					trip = <&cpu5_alert0>;
+					trip = <&gaokun_cpu5_tsens0_passive>;
 					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-
-			trips {
-				cpu5_alert0: trip-point0 {
-					temperature = <85000>;
-					hysteresis = <2000>;
-					type = "passive";
 				};
 			};
 		};
@@ -364,21 +380,21 @@
 		cpu6-thermal {
 			polling-delay-passive = <250>;
 
+			trips {
+				gaokun_cpu6_tsens0_passive: passive {
+					temperature = <80000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
 			cooling-maps {
 				map0 {
-					trip = <&cpu6_alert0>;
+					trip = <&gaokun_cpu6_tsens0_passive>;
 					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-
-			trips {
-				cpu6_alert0: trip-point0 {
-					temperature = <85000>;
-					hysteresis = <2000>;
-					type = "passive";
 				};
 			};
 		};
@@ -386,21 +402,197 @@
 		cpu7-thermal {
 			polling-delay-passive = <250>;
 
+			trips {
+				gaokun_cpu7_tsens0_passive: passive {
+					temperature = <80000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
 			cooling-maps {
 				map0 {
-					trip = <&cpu7_alert0>;
+					trip = <&gaokun_cpu7_tsens0_passive>;
 					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
+		};
+
+		cpu0-1-thermal {
+			polling-delay-passive = <250>;
 
 			trips {
-				cpu7_alert0: trip-point0 {
+				gaokun_cpu0_tsens1_passive: passive {
 					temperature = <85000>;
 					hysteresis = <2000>;
 					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gaokun_cpu0_tsens1_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu1-1-thermal {
+			polling-delay-passive = <250>;
+
+			trips {
+				gaokun_cpu1_tsens1_passive: passive {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gaokun_cpu1_tsens1_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu2-1-thermal {
+			polling-delay-passive = <250>;
+
+			trips {
+				gaokun_cpu2_tsens1_passive: passive {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gaokun_cpu2_tsens1_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu3-1-thermal {
+			polling-delay-passive = <250>;
+
+			trips {
+				gaokun_cpu3_tsens1_passive: passive {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gaokun_cpu3_tsens1_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu4-1-thermal {
+			polling-delay-passive = <250>;
+
+			trips {
+				gaokun_cpu4_tsens1_passive: passive {
+					temperature = <80000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gaokun_cpu4_tsens1_passive>;
+					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu5-1-thermal {
+			polling-delay-passive = <250>;
+
+			trips {
+				gaokun_cpu5_tsens1_passive: passive {
+					temperature = <80000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gaokun_cpu5_tsens1_passive>;
+					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu6-1-thermal {
+			polling-delay-passive = <250>;
+
+			trips {
+				gaokun_cpu6_tsens1_passive: passive {
+					temperature = <80000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gaokun_cpu6_tsens1_passive>;
+					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu7-1-thermal {
+			polling-delay-passive = <250>;
+
+			trips {
+				gaokun_cpu7_tsens1_passive: passive {
+					temperature = <80000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gaokun_cpu7_tsens1_passive>;
+					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -605,10 +797,7 @@
 			regulator-max-microvolt = <1200000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 			regulator-boot-on;
-			// HACK: wrongly voting for LPM may block DP Alt
-			// regulator-allow-set-load;
-			// regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
-			// 			   RPMH_REGULATOR_MODE_HPM>;
+			/* LPM votes can block DisplayPort Alt Mode on this board. */
 		};
 
 		vreg_l4b: ldo4 {
@@ -616,10 +805,7 @@
 			regulator-min-microvolt = <912000>;
 			regulator-max-microvolt = <912000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
-			// HACK: wrongly voting for LPM may block DP Alt
-			// regulator-allow-set-load;
-			// regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
-			// 			   RPMH_REGULATOR_MODE_HPM>;
+			/* LPM votes can block DisplayPort Alt Mode on this board. */
 		};
 
 		vreg_l6b: ldo6 {
@@ -728,10 +914,7 @@
 			regulator-min-microvolt = <1200000>;
 			regulator-max-microvolt = <1200000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
-			// HACK: wrongly voting for LPM may block DP Alt
-			// regulator-allow-set-load;
-			// regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
-			// 			   RPMH_REGULATOR_MODE_HPM>;
+			/* LPM votes can block DisplayPort Alt Mode on this board. */
 		};
 
 		vreg_l6d: ldo6 {
@@ -769,21 +952,7 @@
 			regulator-min-microvolt = <912000>;
 			regulator-max-microvolt = <912000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
-			/*
-			 * usb_0_qmpphy is its only consumer here, but port0's
-			 * USB2 side, the multiport controller and PCIe need it
-			 * too: the Windows PEP votes LDO9_D for URS0, USB2 and
-			 * PCI2-6. Without this, every combo PHY exit
-			 * (orientation or mode switch, device-mode suspend)
-			 * turns it off; port0's dwc3 then fails to soft-reset
-			 * (-110), and suspending with usb_0 in device mode
-			 * resets the board.
-			 */
-			regulator-always-on;
-			// HACK: wrongly voting for LPM may block DP Alt
-			// regulator-allow-set-load;
-			// regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
-			// 			   RPMH_REGULATOR_MODE_HPM>;
+			/* LPM votes can block DisplayPort Alt Mode on this board. */
 		};
 /*
 		vreg_l10d: ldo10 {
@@ -822,11 +991,10 @@
 	status = "okay";
 
 	zap-shader {
-		memory-region = <&gpu_mem>;
+		memory-region = <&pil_gpu_mem>;
 		firmware-name = "qcom/sc8280xp/HUAWEI/gaokun3/qcdxkmsuc8280.mbn";
 	};
 };
-
 
 /* CB0 faults assert SPI 675 on Gaokun3, not the SoC DT's SPI 678. */
 &gpu_smmu {
@@ -947,6 +1115,7 @@
 
 		/* The EC IRQ is quiesced across suspend before enabling wake events. */
 		wakeup-source;
+
 		pinctrl-0 = <&ec_default>;
 		pinctrl-names = "default";
 
@@ -1026,6 +1195,13 @@
 	};
 };
 
+&iris {
+	firmware-name = "qcom/sc8280xp/HUAWEI/gaokun3/qcvss8280.mbn";
+	memory-region = <&pil_video_mem>, <&iris_iova>;
+
+	status = "okay";
+};
+
 &mdss0 {
 	status = "okay";
 };
@@ -1060,15 +1236,13 @@
 	status = "okay";
 
 	panel: panel@0 {
-		compatible = "csot,ppc357db1-4", "himax,hx83121a";
+		compatible = "boe,ppc357db1-4", "himax,hx83121a";
 		reg = <0>;
 
-		pinctrl-0 = <&disp_reset_n>, <&mdp_vsync_active>, <&panel_id_default>;
+		pinctrl-0 = <&disp_reset_n>, <&mdp_vsync_active>;
 		pinctrl-names = "default";
 
 		reset-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
-		panel-id-gpios = <&tlmm 102 GPIO_ACTIVE_HIGH>,
-				 <&tlmm 91 GPIO_ACTIVE_HIGH>;
 
 		vddi-supply = <&vreg_l2b>;
 		avdd-supply = <&vreg_avdd_5p5>;
@@ -1134,9 +1308,6 @@
 };
 
 &pcie2a {
-	perst-gpios = <&tlmm 143 GPIO_ACTIVE_LOW>;
-	wake-gpios = <&tlmm 145 GPIO_ACTIVE_LOW>;
-
 	vddpe-3v3-supply = <&vreg_nvme>;
 
 	pinctrl-0 = <&pcie2a_default>;
@@ -1152,11 +1323,13 @@
 	status = "okay";
 };
 
+&pcie2a_port0 {
+	reset-gpios = <&tlmm 143 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 145 GPIO_ACTIVE_LOW>;
+};
+
 &pcie4 {
 	max-link-speed = <2>;
-
-	perst-gpios = <&tlmm 141 GPIO_ACTIVE_LOW>;
-	wake-gpios = <&tlmm 139 GPIO_ACTIVE_LOW>;
 
 	vddpe-3v3-supply = <&vreg_wlan>;
 
@@ -1167,6 +1340,9 @@
 };
 
 &pcie4_port0 {
+	reset-gpios = <&tlmm 141 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 139 GPIO_ACTIVE_LOW>;
+
 	wifi@0 {
 		compatible = "pci17cb,1103";
 		reg = <0x10000 0x0 0x0 0x0 0x0>;
@@ -1512,9 +1688,6 @@
 };
 
 &uart2 {
-	pinctrl-0 = <&uart2_default>;
-	pinctrl-names = "default";
-
 	status = "okay";
 
 	bluetooth {
@@ -1667,7 +1840,7 @@
 
 	vdd-micb-supply = <&vreg_s10b>;
 
-	qcom,dmic-sample-rate = <4800000>;
+	qcom,dmic-sample-rate = <3200000>;
 
 	status = "okay";
 };
@@ -1883,36 +2056,6 @@
 		};
 	};
 
-	spi20_default: spi20-default-state {
-		miso-pins {
-			pins = "gpio87";
-			function = "qup20";
-			drive-strength = <2>;
-			bias-pull-down;
-		};
-
-		mosi-pins {
-			pins = "gpio88";
-			function = "qup20";
-			drive-strength = <2>;
-			bias-pull-down;
-		};
-
-		clk-pins {
-			pins = "gpio89";
-			function = "qup20";
-			drive-strength = <2>;
-			bias-pull-down;
-		};
-
-		cs-pins {
-			pins = "gpio90";
-			function = "qup20";
-			drive-strength = <2>;
-			bias-pull-down;
-		};
-	};
-
 	spi6_default: spi6-default-state {
 		miso-n-pins {
 			pins = "gpio154";
@@ -1959,44 +2102,6 @@
 			function = "gpio";
 			drive-strength = <2>;
 			bias-disable;
-			output-high;
-		};
-	};
-
-	ts1_default: ts1-default-state {
-		int-n-pins {
-			pins = "gpio39";
-			function = "gpio";
-			drive-strength = <2>;
-			bias-disable;
-		};
-	};
-
-	uart2_default: uart2-default-state {
-		cts-pins {
-			pins = "gpio121";
-			function = "qup2";
-			bias-bus-hold;
-		};
-
-		rts-pins {
-			pins = "gpio122";
-			function = "qup2";
-			drive-strength = <2>;
-			bias-disable;
-		};
-
-		rx-pins {
-			pins = "gpio124";
-			function = "qup2";
-			bias-pull-up;
-		};
-
-		tx-pins {
-			pins = "gpio123";
-			function = "qup2";
-			drive-strength = <2>;
-			bias-disable;
 		};
 	};
 
@@ -2031,8 +2136,3 @@
 };
 
 #include "sc8280xp-huawei-gaokun3-camera.dtsi"
-
-&iris {
-	firmware-name = "qcom/sc8280xp/HUAWEI/gaokun3/qcvss8280.mbn";
-	status = "okay";
-};
