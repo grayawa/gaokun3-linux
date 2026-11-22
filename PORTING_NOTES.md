@@ -14,6 +14,7 @@ UCSI and battery implementations produced by the earlier local-priority draft.
 
 The following local changes were explicitly restored:
 - gaokun3 I2C-HID touchscreen and dual-Himax touchscreen description
+- Keep the retired HX83121A SPI driver excluded: remove himax-spi-core.c, hx-algo.c/h, and their Kconfig/Makefile/defconfig entries
 - EC wakeup-source property (paired with the local EC suspend/IRQ quiescing code)
 - CONFIG_SCHED_BORE and the requested KPROBES/FTRACE/KPROBE_EVENTS/TRACING/TRACEFS_FS options
 
