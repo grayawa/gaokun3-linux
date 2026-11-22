@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: linux-7.2.15-bore-port
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   port:
@@ -29,6 +29,9 @@ jobs:
         with:
           fetch-depth: 1
           filter: blob:none
+          sparse-checkout: |
+            scripts/port-7.2.15-bore.sh
+          sparse-checkout-cone-mode: false
           persist-credentials: true
 
       - name: Check toolchain
