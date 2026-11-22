@@ -88,7 +88,7 @@ else
     echo
     echo "## Conflict paths"
     echo
-    while IFS= read -r path; do printf -- '- \`%s\`\\n' "$path"; done \
+    while IFS= read -r path; do printf -- '- `%s`\n' "$path"; done \
       < "$REPORT_DIR/conflicts.txt"
   } > "$REPORT_DIR/PORTING_NOTES.md"
   # Insert review notes into the new Git tree without altering the checked-out
