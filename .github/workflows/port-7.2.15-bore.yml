@@ -39,7 +39,7 @@ jobs:
           set -euo pipefail
           git --version
           help_text="$(git merge-tree -h 2>&1 || true)"
-          grep -q -- '--merge-base' <<< "$help_text"
+          grep -q 'merge-base' <<< "$help_text"
 
       - name: Generate review branch from 7.2.15-bore
         run: bash scripts/port-7.2.15-bore.sh
