@@ -677,6 +677,7 @@ static void pci_init_host_bridge(struct pci_host_bridge *bridge)
 	bridge->domain_nr = PCI_DOMAIN_NR_NOT_SET;
 	bridge->native_cxl_error = 1;
 	bridge->dev.type = &pci_host_bridge_type;
+	mutex_init(&bridge->recovery_lock);
 	pci_ide_init_host_bridge(bridge);
 
 	device_initialize(&bridge->dev);
@@ -2586,6 +2587,11 @@ bool pci_bus_generic_read_dev_vendor_id(struct pci_bus *bus, int devfn, u32 *l,
 bool pci_bus_read_dev_vendor_id(struct pci_bus *bus, int devfn, u32 *l,
 				int timeout)
 {
+	if (pci_of_device_skip_config_read(bus, devfn)) {
+		PCI_SET_ERROR_RESPONSE(l);
+		return false;
+	}
+
 	return pci_bus_generic_read_dev_vendor_id(bus, devfn, l, timeout);
 }
 EXPORT_SYMBOL(pci_bus_read_dev_vendor_id);

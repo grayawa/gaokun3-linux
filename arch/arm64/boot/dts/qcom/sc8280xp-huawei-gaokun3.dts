@@ -22,6 +22,10 @@
 #include "sc8280xp.dtsi"
 #include "sc8280xp-pmics.dtsi"
 
+/delete-node/ &pil_video_mem;
+/delete-node/ &pil_nsp1_mem;
+/delete-node/ &remoteproc_nsp1;
+
 / {
 	chassis-type = "tablet";
 	model = "Matebook E Go";
@@ -203,6 +207,11 @@
 		pinctrl-0 = <&hastings_reg_en>;
 		pinctrl-names = "default";
 
+		/*
+		 * pcie4 disables its vddpe-3v3 whenever the link goes down, and
+		 * the firmware keeps running in L2 with WoWLAN armed.
+		 */
+		regulator-always-on;
 		regulator-boot-on;
 	};
 
@@ -225,6 +234,12 @@
 			alloc-ranges = <0x0 0x80000000 0x0 0x80000000>;
 			reusable;
 			linux,cma-default;
+		};
+
+		/* The Gaokun3 firmware layout places the video image here. */
+		pil_video_mem: video-region@8c600000 {
+			reg = <0 0x8c600000 0 0x700000>;
+			no-map;
 		};
 	};
 
@@ -848,7 +863,7 @@
 
 
 &i2c4 {
-	clock-frequency = <400000>;
+	clock-frequency = <1000000>;
 
 	pinctrl-0 = <&i2c4_default>;
 	pinctrl-names = "default";
@@ -864,11 +879,33 @@
 		compatible = "hid-over-i2c";
 		reg = <0x4f>;
 
-		hid-descr-addr = <0x1>;
-		interrupts-extended = <&tlmm 175 IRQ_TYPE_LEVEL_LOW>;
+&spi6 {
+	pinctrl-0 = <&spi6_default>;
+	pinctrl-names = "default";
 
-		vdd-supply = <&vreg_misc_3p3>;
-		vddl-supply = <&vreg_s10b>;
+	status = "okay";
+
+	touchscreen@0 {
+		compatible = "himax,hx83121a-ts";
+		reg = <0>;
+
+		// TODO: power supply, always on rencently
+		interrupts-extended = <&tlmm 175 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 99 GPIO_ACTIVE_LOW>;
+
+		panel = <&panel>;
+
+		spi-max-frequency = <12000000>;
+
+		touchscreen-size-x = <2560>;
+		touchscreen-size-y = <1600>;
+
+		/*
+		 * internally handle invert first, two transformations are
+		 * non-comutative even if we can swap first.
+		 */
+		touchscreen-swapped-x-y;
+		touchscreen-inverted-x;
 
 		pinctrl-0 = <&ts0_default>;
 		pinctrl-names = "default";
@@ -1026,6 +1063,13 @@
 	};
 };
 
+&iris {
+	firmware-name = "qcom/sc8280xp/HUAWEI/gaokun3/qcvss8280.mbn";
+	memory-region = <&pil_video_mem>, <&iris_iova>;
+
+	status = "okay";
+};
+
 &mdss0 {
 	status = "okay";
 };
@@ -1137,6 +1181,85 @@
 	perst-gpios = <&tlmm 143 GPIO_ACTIVE_LOW>;
 	wake-gpios = <&tlmm 145 GPIO_ACTIVE_LOW>;
 
+	qcom,dual-dsi-mode;
+	qcom,master-dsi;
+	qcom,sync-dual-dsi;
+
+	status = "okay";
+
+	panel: panel@0 {
+		compatible = "boe,ppc357db1-4", "himax,hx83121a";
+		reg = <0>;
+
+		pinctrl-0 = <&disp_reset_n>, <&mdp_vsync_active>;
+		pinctrl-names = "default";
+
+		reset-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
+
+		vddi-supply = <&vreg_l2b>;
+		avdd-supply = <&vreg_avdd_5p5>;
+		avee-supply = <&vreg_avee_5p5>;
+		bl-supply = <&vreg_dsi_bl>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				panel_in_0: endpoint {
+					remote-endpoint = <&mdss0_dsi0_out>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				panel_in_1: endpoint {
+					remote-endpoint = <&mdss0_dsi1_out>;
+				};
+			};
+		};
+	};
+};
+
+&mdss0_dsi0_out {
+	data-lanes = <0 1 2 3>;
+	remote-endpoint = <&panel_in_0>;
+};
+
+&mdss0_dsi0_phy {
+	vdds-supply = <&vreg_l6b>;
+
+	status = "okay";
+};
+
+&mdss0_dsi1 {
+	vdda-supply = <&vreg_l3b>;
+
+	qcom,dual-dsi-mode;
+	qcom,sync-dual-dsi;
+
+	status = "okay";
+
+	/* DSI1 is slave, so use DSI0 clocks */
+	assigned-clock-parents = <&mdss0_dsi0_phy DSI_BYTE_PLL_CLK>,
+				 <&mdss0_dsi0_phy DSI_PIXEL_PLL_CLK>;
+};
+
+&mdss0_dsi1_out {
+	data-lanes = <0 1 2 3>;
+	remote-endpoint = <&panel_in_1>;
+};
+
+&mdss0_dsi1_phy {
+	vdds-supply = <&vreg_l6b>;
+
+	status = "okay";
+};
+
+&pcie2a {
 	vddpe-3v3-supply = <&vreg_nvme>;
 
 	pinctrl-0 = <&pcie2a_default>;
@@ -1152,11 +1275,13 @@
 	status = "okay";
 };
 
+&pcie2a_port0 {
+	reset-gpios = <&tlmm 143 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 145 GPIO_ACTIVE_LOW>;
+};
+
 &pcie4 {
 	max-link-speed = <2>;
-
-	perst-gpios = <&tlmm 141 GPIO_ACTIVE_LOW>;
-	wake-gpios = <&tlmm 139 GPIO_ACTIVE_LOW>;
 
 	vddpe-3v3-supply = <&vreg_wlan>;
 
@@ -1167,6 +1292,9 @@
 };
 
 &pcie4_port0 {
+	reset-gpios = <&tlmm 141 GPIO_ACTIVE_LOW>;
+	wake-gpios = <&tlmm 139 GPIO_ACTIVE_LOW>;
+
 	wifi@0 {
 		compatible = "pci17cb,1103";
 		reg = <0x10000 0x0 0x0 0x0 0x0>;
@@ -1512,9 +1640,6 @@
 };
 
 &uart2 {
-	pinctrl-0 = <&uart2_default>;
-	pinctrl-names = "default";
-
 	status = "okay";
 
 	bluetooth {
@@ -1667,7 +1792,7 @@
 
 	vdd-micb-supply = <&vreg_s10b>;
 
-	qcom,dmic-sample-rate = <4800000>;
+	qcom,dmic-sample-rate = <3200000>;
 
 	status = "okay";
 };

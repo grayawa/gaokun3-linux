@@ -3,6 +3,7 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/moduleparam.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-mem2mem.h>
 
@@ -94,16 +95,6 @@ static bool check_format(struct iris_inst *inst, u32 pixfmt, u32 type)
 
 	if (i == size)
 		return false;
-
-	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-		if (iris_fmt_is_8bit(pixfmt) &&
-		    inst->fw_caps[BIT_DEPTH].value == BIT_DEPTH_10)
-			return false;
-
-		if (iris_fmt_is_10bit(pixfmt) &&
-		    inst->fw_caps[BIT_DEPTH].value != BIT_DEPTH_10)
-			return false;
-	}
 
 	return true;
 }
@@ -353,9 +344,25 @@ void iris_vdec_src_change(struct iris_inst *inst)
 	v4l2_event_queue_fh(&inst->fh, &event);
 }
 
+unsigned int iris_seek_mode = 1;
+module_param_named(seek_mode, iris_seek_mode, uint, 0644);
+MODULE_PARM_DESC(seek_mode, "Gen1 decoder seek: 1 flush and continue (default), 0 STOP and restart");
+
+bool iris_eos_flush;
+module_param_named(eos_flush, iris_eos_flush, bool, 0644);
+MODULE_PARM_DESC(eos_flush, "Flush Gen1 decoder output at EOS instead of retaining DPBs (default: N)");
+
 int iris_vdec_streamon_input(struct iris_inst *inst)
 {
 	int ret;
+
+	if (inst->seek_resume) {
+		inst->frame_counter = 0;
+		ret = iris_process_streamon_input(inst);
+		if (!ret && inst->state == IRIS_INST_STREAMING)
+			inst->seek_resume = false;
+		return ret;
+	}
 
 	ret = iris_set_properties(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	if (ret)
@@ -389,9 +396,11 @@ int iris_vdec_streamon_output(struct iris_inst *inst)
 	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
 	int ret;
 
-	ret = hfi_ops->session_set_config_params(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-	if (ret)
-		return ret;
+	if (!inst->seek_resume || inst->sub_state & IRIS_INST_SUB_FIRST_IPSC) {
+		ret = hfi_ops->session_set_config_params(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+		if (ret)
+			return ret;
+	}
 
 	iris_get_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 
@@ -410,6 +419,9 @@ int iris_vdec_streamon_output(struct iris_inst *inst)
 	ret = iris_queue_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	if (ret)
 		goto error;
+
+	if (inst->state == IRIS_INST_STREAMING)
+		inst->seek_resume = false;
 
 	return ret;
 
@@ -519,6 +531,11 @@ int iris_vdec_start_cmd(struct iris_inst *inst)
 		dev_err(inst->core->dev, "start called before receiving last_flag\n");
 		iris_inst_change_state(inst, IRIS_INST_ERROR);
 		return -EBUSY;
+	}
+
+	if (inst->core->iris_firmware_data == &iris_hfi_gen1_data) {
+		inst->last_buffer_dequeued = false;
+		v4l2_m2m_clear_state(inst->m2m_ctx);
 	}
 
 	return iris_inst_change_sub_state(inst, clear_sub_state, 0);

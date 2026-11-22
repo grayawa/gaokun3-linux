@@ -1324,6 +1324,7 @@ static int ath11k_core_resume_default(struct ath11k_base *ab)
 {
 	struct ath11k *ar;
 	long time_left;
+	bool allocated;
 	int ret;
 
 	time_left = wait_for_completion_timeout(&ab->restart_completed,
@@ -1332,6 +1333,12 @@ static int ath11k_core_resume_default(struct ath11k_base *ab)
 		ath11k_warn(ab, "timeout while waiting for restart complete");
 		return -ETIMEDOUT;
 	}
+
+	mutex_lock(&ab->core_lock);
+	allocated = ath11k_dp_rx_mon_status_allocated(ab);
+	mutex_unlock(&ab->core_lock);
+	if (!allocated)
+		return 0;
 
 	/* So far only single_pdev_only devices can reach here,
 	 * so it is valid to handle the first, and the only, pdev.
@@ -2099,7 +2106,8 @@ err_spectral_unregister:
 err_thermal_unregister:
 	ath11k_thermal_unregister(ab);
 err_mac_unregister:
-	ath11k_mac_unregister(ab);
+	if (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags))
+		ath11k_mac_unregister(ab);
 err_dp_pdev_free:
 	ath11k_dp_pdev_free(ab);
 err_pdev_debug:
@@ -2257,7 +2265,8 @@ static int ath11k_core_start(struct ath11k_base *ab)
 err_reo_cleanup:
 	ath11k_dp_pdev_reo_cleanup(ab);
 err_mac_destroy:
-	ath11k_mac_destroy(ab);
+	if (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags))
+		ath11k_mac_destroy(ab);
 err_hif_stop:
 	ath11k_hif_stop(ab);
 err_wmi_detach:
@@ -2319,6 +2328,8 @@ int ath11k_core_qmi_firmware_ready(struct ath11k_base *ab)
 		goto err_firmware_stop;
 	}
 
+	clear_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+
 	if (ath11k_frame_mode == ATH11K_HW_TXRX_RAW)
 		set_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags);
 
@@ -2341,7 +2352,8 @@ int ath11k_core_qmi_firmware_ready(struct ath11k_base *ab)
 
 err_core_stop:
 	ath11k_core_stop(ab);
-	ath11k_mac_destroy(ab);
+	if (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags))
+		ath11k_mac_destroy(ab);
 err_dp_free:
 	ath11k_dp_free(ab);
 	mutex_unlock(&ab->core_lock);
@@ -2473,8 +2485,7 @@ void ath11k_core_pre_reconfigure_recovery(struct ath11k_base *ab)
 		complete(&ar->thermal.wmi_sync);
 
 		wake_up(&ar->dp.tx_empty_waitq);
-		idr_for_each(&ar->txmgmt_idr,
-			     ath11k_mac_tx_mgmt_pending_free, ar);
+		ath11k_mac_tx_mgmt_pending_free(ar);
 		idr_destroy(&ar->txmgmt_idr);
 		wake_up(&ar->txmgmt_empty_waitq);
 
@@ -2534,6 +2545,32 @@ static void ath11k_core_post_reconfigure_recovery(struct ath11k_base *ab)
 	complete(&ab->driver_recovery);
 }
 
+static void ath11k_core_end_reset_without_restart(struct ath11k_base *ab)
+{
+	struct ath11k *ar;
+	int radio_index;
+
+	for (radio_index = 0; radio_index < ab->num_radios; radio_index++) {
+		ar = ab->pdevs[radio_index].ar;
+		if (ar && (ar->state == ATH11K_STATE_RESTARTING ||
+			   ar->state == ATH11K_STATE_RESTARTED))
+			return;
+	}
+
+	ab->is_reset = false;
+	__pm_relax(ab->recovery_ws);
+	atomic_dec(&ab->reset_count);
+	complete(&ab->reset_complete);
+}
+
+static bool ath11k_core_reset_follows(struct ath11k_base *ab)
+{
+	return work_pending(&ab->reset_work) ||
+	       delayed_work_pending(&ab->reset_retry_work) ||
+	       test_bit(ATH11K_FLAG_CRASH_PENDING, &ab->dev_flags) ||
+	       atomic_read(&ab->reset_count) > 1;
+}
+
 static void ath11k_core_restart(struct work_struct *work)
 {
 	struct ath11k_base *ab = container_of(work, struct ath11k_base, restart_work);
@@ -2545,6 +2582,13 @@ static void ath11k_core_restart(struct work_struct *work)
 	ret = ath11k_core_reconfigure_on_crash(ab);
 	if (ret) {
 		ath11k_err(ab, "failed to reconfigure driver on crash recovery\n");
+		spin_lock_bh(&ab->base_lock);
+		if (!ath11k_core_reset_follows(ab) &&
+		    !test_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags))
+			ath11k_core_schedule_reset(ab);
+		spin_unlock_bh(&ab->base_lock);
+		complete_all(&ab->reconfigure_complete);
+		complete(&ab->restart_completed);
 		return;
 	}
 
@@ -2553,15 +2597,54 @@ static void ath11k_core_restart(struct work_struct *work)
 
 	if (!ab->is_reset)
 		ath11k_core_post_reconfigure_recovery(ab);
+	else
+		ath11k_core_end_reset_without_restart(ab);
 
 	complete(&ab->restart_completed);
+}
+
+static bool ath11k_core_reset_allowed(struct ath11k_base *ab)
+{
+	time64_t now = ktime_get_boottime_seconds();
+	time64_t hold;
+
+	if (now - ab->reset_time >= ATH11K_RESET_LOOP_WINDOW_SEC)
+		ab->reset_loop = 0;
+
+	if (ab->reset_loop >= ATH11K_RESET_LOOP_MAX) {
+		ath11k_err(ab, "firmware crashed again after %u resets, giving up\n",
+			   ab->reset_loop);
+		ab->reset_time = now;
+		__pm_relax(ab->recovery_ws);
+		return false;
+	}
+
+	if (ab->reset_loop >= ATH11K_RESET_LOOP_FREE) {
+		hold = ab->reset_time - now +
+		       (ATH11K_RESET_LOOP_BACKOFF_SEC <<
+			(ab->reset_loop - ATH11K_RESET_LOOP_FREE));
+		if (hold > 0) {
+			ath11k_warn(ab, "firmware crashed again after %u resets, next one in %lld s\n",
+				    ab->reset_loop, hold);
+			set_bit(ATH11K_FLAG_CRASH_PENDING, &ab->dev_flags);
+			__pm_relax(ab->recovery_ws);
+			queue_delayed_work(ab->workqueue_aux, &ab->reset_retry_work,
+					   secs_to_jiffies(hold));
+			return false;
+		}
+	}
+
+	ab->reset_loop++;
+	ab->reset_time = now;
+
+	return true;
 }
 
 static void ath11k_core_reset(struct work_struct *work)
 {
 	struct ath11k_base *ab = container_of(work, struct ath11k_base, reset_work);
-	int reset_count, fail_cont_count;
-	long time_left;
+	int reset_count;
+	int ret;
 
 	if (!(test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags))) {
 		ath11k_warn(ab, "ignore reset dev flags 0x%lx\n", ab->dev_flags);
@@ -2575,35 +2658,27 @@ static void ath11k_core_reset(struct work_struct *work)
 	 */
 	fail_cont_count = atomic_read(&ab->fail_cont_count);
 
-	if (fail_cont_count >= ATH11K_RESET_MAX_FAIL_COUNT_FINAL)
+	if (!ath11k_core_reset_allowed(ab))
 		return;
 
-	if (fail_cont_count >= ATH11K_RESET_MAX_FAIL_COUNT_FIRST &&
-	    time_before(jiffies, ab->reset_fail_timeout))
-		return;
-
+	reinit_completion(&ab->reset_complete);
 	reset_count = atomic_inc_return(&ab->reset_count);
 
 	if (reset_count > 1) {
-		/* Sometimes it happened another reset worker before the previous one
-		 * completed, then the second reset worker will destroy the previous one,
-		 * thus below is to avoid that.
-		 */
 		ath11k_warn(ab, "already resetting count %d\n", reset_count);
 
-		reinit_completion(&ab->reset_complete);
-		time_left = wait_for_completion_timeout(&ab->reset_complete,
-							ATH11K_RESET_TIMEOUT_HZ);
+		wait_for_completion_timeout(&ab->reset_complete,
+					    ATH11K_RESET_TIMEOUT_HZ);
+		flush_work(&ab->restart_work);
 
-		if (time_left) {
-			ath11k_dbg(ab, ATH11K_DBG_BOOT, "to skip reset\n");
+		if (test_bit(ATH11K_FLAG_SYSTEM_SUSPEND, &ab->dev_flags)) {
 			atomic_dec(&ab->reset_count);
+			ath11k_core_schedule_reset(ab);
 			return;
 		}
 
-		ab->reset_fail_timeout = jiffies + ATH11K_RESET_FAIL_TIMEOUT_HZ;
-		/* Record the continuous recovery fail count when recovery failed*/
-		atomic_inc(&ab->fail_cont_count);
+		atomic_set(&ab->reset_count, 1);
+		pm_wakeup_ws_event(ab->recovery_ws, ATH11K_RECOVERY_WAKEUP_MS, false);
 	}
 
 	ath11k_dbg(ab, ATH11K_DBG_BOOT, "reset starting\n");
@@ -2621,14 +2696,19 @@ static void ath11k_core_reset(struct work_struct *work)
 
 	ath11k_dbg(ab, ATH11K_DBG_BOOT, "waiting recovery start...\n");
 
-	time_left = wait_for_completion_timeout(&ab->recovery_start,
-						ATH11K_RECOVER_START_TIMEOUT_HZ);
+	wait_for_completion_timeout(&ab->recovery_start,
+				    ATH11K_RECOVER_START_TIMEOUT_HZ);
 
 	ath11k_hif_irq_disable(ab);
 	ath11k_hif_ce_irq_disable(ab);
 
 	ath11k_hif_power_down(ab, false);
-	ath11k_hif_power_up(ab);
+	ret = ath11k_hif_power_up(ab);
+	if (ret) {
+		ath11k_err(ab, "failed to power up for the reset: %d\n", ret);
+		complete_all(&ab->reconfigure_complete);
+		return;
+	}
 
 	ath11k_dbg(ab, ATH11K_DBG_BOOT, "reset started\n");
 }
@@ -2867,6 +2947,7 @@ struct ath11k_base *ath11k_core_alloc(struct device *dev, size_t priv_size,
 	INIT_WORK(&ab->restart_work, ath11k_core_restart);
 	INIT_WORK(&ab->update_11d_work, ath11k_update_11d);
 	INIT_WORK(&ab->reset_work, ath11k_core_reset);
+	INIT_DELAYED_WORK(&ab->reset_retry_work, ath11k_core_reset_retry);
 	INIT_WORK(&ab->dump_work, ath11k_coredump_upload);
 	timer_setup(&ab->rx_replenish_retry, ath11k_ce_rx_replenish_retry, 0);
 	init_completion(&ab->htc_suspend);

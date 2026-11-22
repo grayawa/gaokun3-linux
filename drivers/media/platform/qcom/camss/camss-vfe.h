@@ -77,6 +77,13 @@ struct vfe_output {
 	};
 	enum vfe_output_state state;
 	unsigned int sequence;
+	bool error;		/* the frame being written came in corrupt */
+	/*
+	 * vfe-17x: the next frame has a buffer of this output, and the one
+	 * after has one too (only from a stream start that armed two)
+	 */
+	bool armed_next;
+	bool armed_ahead;
 
 	int wait_reg_update;
 	struct completion sof;
@@ -120,7 +127,20 @@ struct vfe_hw_ops {
 	void (*vfe_buf_done)(struct vfe_device *vfe, int port_id);
 	void (*vfe_wm_update)(struct vfe_device *vfe, u8 wm, u32 addr,
 			      struct vfe_line *line);
+	/*
+	 * Optional nodes of the pixel pipeline besides its own output:
+	 * parameters, statistics, a second (display) output
+	 */
+	int (*meta_register)(struct vfe_device *vfe, struct v4l2_device *v4l2_dev);
+	void (*meta_unregister)(struct vfe_device *vfe);
+	/* Optional: the streams must restart, tell their queues */
+	void (*fatal_error)(struct vfe_device *vfe);
+	/* Optional: the pixel line's frame is corrupt, so is its display frame */
+	void (*pix_frame_error)(struct vfe_device *vfe);
 };
+
+struct vfe_pix_meta;
+struct vfe_pix_disp;
 
 struct vfe_isr_ops {
 	void (*reset_ack)(struct vfe_device *vfe);
@@ -141,6 +161,45 @@ struct vfe_subdev_resources {
 	const struct vfe_hw_ops *hw_ops;
 	const struct camss_formats *formats_rdi;
 	const struct camss_formats *formats_pix;
+	/*
+	 * Output formats of a pixel processing pipeline (demosaic, colour
+	 * conversion, scaler). If set, the PIX line sink accepts
+	 * @formats_pix and its source pad and video node use these formats.
+	 */
+	const struct camss_formats *formats_pix_out;
+};
+
+/*
+ * Two pixel paths writing the halves of one frame wider than an IFE line:
+ * the master owns the buffers of its video node, the slave writes its stripe
+ * at x_offset into them. Protected by the master's output_lock, and on the
+ * slave also by its own.
+ */
+#define VFE_DUAL_HELD 4
+/* The two stripes of a frame complete within this time of each other */
+#define VFE_DUAL_MATCH_NS (8 * NSEC_PER_MSEC)
+
+struct vfe_pix_dual {
+	struct vfe_device *peer;
+	bool master;
+	u32 x_offset;		/* master: byte offset of the slave stripe */
+	u64 slave_ts;		/* master: when the slave last wrote a stripe */
+	bool slave_error;	/* master: that stripe came in corrupt */
+	unsigned int nheld;	/* master: buffers waiting for the slave */
+	struct {
+		struct camss_buffer *buf;
+		u64 ts;
+		bool error;
+	} held[VFE_DUAL_HELD];
+};
+
+/* Error interrupts of a VFE, from its first stream start on */
+struct vfe_errors {
+	u32 count;		/* error interrupts */
+	u64 window;		/* start of the current storm window */
+	u32 window_count;	/* error interrupts in it */
+	bool off;		/* turned off after a storm */
+	bool fatal;		/* the queues were told to restart */
 };
 
 struct vfe_device {
@@ -162,6 +221,16 @@ struct vfe_device {
 	enum vfe_line_id wm_output_map[MSM_VFE_IMAGE_MASTERS_NUM];
 	struct vfe_line line[VFE_LINE_NUM_MAX];
 	u32 reg_update;
+	struct vfe_pix_meta *pix_meta;
+	struct vfe_pix_disp *pix_disp;
+	/* vfe-17x: the outputs of the next frame once it is written, 0 before */
+	u32 pix_next_outputs;
+	/* vfe-17x: the RDI lines linked when the pixel path started, by line id */
+	u8 pix_rdi_linked;
+	/* vfe-17x: the pixel path is stopping, no display output may start */
+	bool pix_stopping;
+	struct vfe_pix_dual dual;
+	struct vfe_errors errors;
 	u8 was_streaming;
 	const struct vfe_subdev_resources *res;
 	const struct vfe_hw_ops_gen1 *ops_gen1;
@@ -193,6 +262,10 @@ void vfe_buf_add_pending(struct vfe_output *output, struct camss_buffer *buffer)
 struct camss_buffer *vfe_buf_get_pending(struct vfe_output *output);
 
 int vfe_flush_buffers(struct camss_video *vid, enum vb2_buffer_state state);
+
+bool vfe_line_running(struct vfe_line *line);
+void vfe_line_frame_error(struct vfe_line *line);
+void vfe_line_fatal_error(struct vfe_line *line);
 
 /*
  * vfe_isr_comp_done - Process composite image done interrupt
@@ -240,6 +313,8 @@ extern const struct camss_formats vfe_formats_rdi_8x96;
 extern const struct camss_formats vfe_formats_pix_8x96;
 extern const struct camss_formats vfe_formats_rdi_845;
 extern const struct camss_formats vfe_formats_pix_845;
+extern const struct camss_formats vfe_formats_pix_8280xp;
+extern const struct camss_formats vfe_formats_pix_out_8280xp;
 
 extern const struct vfe_hw_ops vfe_ops_4_1;
 extern const struct vfe_hw_ops vfe_ops_4_7;
@@ -262,6 +337,21 @@ void vfe_put(struct vfe_device *vfe);
  * Return whether VFE is VFE lite
  */
 bool vfe_is_lite(struct vfe_device *vfe);
+
+/*
+ * vfe_line_has_pix_pipeline - Return if a line runs the pixel pipeline
+ * @vfe: VFE Device
+ * @line_id: VFE line
+ *
+ * True for the PIX line of a full VFE whose resources describe the output
+ * formats of the pixel pipeline (Bayer in, YUV out).
+ */
+static inline bool vfe_line_has_pix_pipeline(const struct vfe_device *vfe,
+					     enum vfe_line_id line_id)
+{
+	return line_id == VFE_LINE_PIX && !vfe->res->is_lite &&
+	       vfe->res->formats_pix_out;
+}
 
 /*
  * vfe_hw_version - Process write master done interrupt
@@ -311,6 +401,7 @@ int vfe_enable_output_v2(struct vfe_line *line);
  *
  * Return 0 on success or a negative error code otherwise
  */
+void vfe_queue_buffer_v2_locked(struct vfe_line *line, struct camss_buffer *buf);
 int vfe_queue_buffer_v2(struct camss_video *vid,
 			struct camss_buffer *buf);
 

@@ -184,19 +184,19 @@ static const struct dpu_dspp_cfg sc8280xp_dspp[] = {
 	{
 		.name = "dspp_0", .id = DSPP_0,
 		.base = 0x54000, .len = 0x1800,
-		.sblk = &sdm845_dspp_sblk,
+		.sblk = &sc8280xp_dspp_sblk,
 	}, {
 		.name = "dspp_1", .id = DSPP_1,
 		.base = 0x56000, .len = 0x1800,
-		.sblk = &sdm845_dspp_sblk,
+		.sblk = &sc8280xp_dspp_sblk,
 	}, {
 		.name = "dspp_2", .id = DSPP_2,
 		.base = 0x58000, .len = 0x1800,
-		.sblk = &sdm845_dspp_sblk,
+		.sblk = &sc8280xp_dspp_sblk,
 	}, {
 		.name = "dspp_3", .id = DSPP_3,
 		.base = 0x5a000, .len = 0x1800,
-		.sblk = &sdm845_dspp_sblk,
+		.sblk = &sc8280xp_dspp_sblk,
 	},
 };
 
@@ -390,7 +390,7 @@ static const struct dpu_perf_cfg sc8280xp_perf_data = {
 		{.rd_enable = 1, .wr_enable = 1},
 		{.rd_enable = 1, .wr_enable = 0}
 	},
-	.clk_inefficiency_factor = 105,
+	.clk_inefficiency_factor = 100,
 	.bw_inefficiency_factor = 120,
 };
 

@@ -216,7 +216,7 @@ static void iris_sys_error_handler(struct work_struct *work)
 			container_of(work, struct iris_core, sys_error_handler.work);
 
 	iris_core_deinit(core);
-	iris_core_init(core);
+	complete_all(&core->sys_error_done);
 }
 
 static int iris_probe(struct platform_device *pdev)
@@ -234,6 +234,8 @@ static int iris_probe(struct platform_device *pdev)
 	core->state = IRIS_CORE_DEINIT;
 	mutex_init(&core->lock);
 	init_completion(&core->core_init_done);
+	init_completion(&core->sys_error_done);
+	complete_all(&core->sys_error_done);
 
 	core->response_packet = devm_kzalloc(core->dev, IFACEQ_CORE_PKT_SIZE, GFP_KERNEL);
 	if (!core->response_packet)
@@ -251,8 +253,6 @@ static int iris_probe(struct platform_device *pdev)
 		return core->irq;
 
 	core->iris_platform_data = of_device_get_match_data(core->dev);
-	core->iris_firmware_desc = core->iris_platform_data->firmware_desc;
-	core->iris_firmware_data = core->iris_firmware_desc->firmware_data;
 
 	core->ubwc_cfg = qcom_ubwc_config_get_data();
 	if (IS_ERR(core->ubwc_cfg))
@@ -270,8 +270,6 @@ static int iris_probe(struct platform_device *pdev)
 	ret = iris_init_resources(core);
 	if (ret)
 		return ret;
-
-	iris_session_init_caps(core);
 
 	ret = v4l2_device_register(dev, &core->v4l2_dev);
 	if (ret)
@@ -367,6 +365,10 @@ static const struct of_device_id iris_dt_match[] = {
 	{
 		.compatible = "qcom,sc7280-venus",
 		.data = &sc7280_data,
+	},
+	{
+		.compatible = "qcom,sc8280xp-iris",
+		.data = &sc8280xp_data,
 	},
 	{
 		.compatible = "qcom,sm8250-venus",

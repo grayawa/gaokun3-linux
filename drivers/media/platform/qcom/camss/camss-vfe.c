@@ -20,6 +20,7 @@
 #include <linux/spinlock.h>
 #include <media/media-entity.h>
 #include <media/v4l2-device.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-subdev.h>
 
 #include "camss-vfe.h"
@@ -283,10 +284,104 @@ const struct camss_formats vfe_formats_pix_845 = {
 	.formats = formats_rdi_845
 };
 
+/* Bayer input of the SC8280XP IFE pixel pipeline (CSID IPP -> CAMIF) */
+static const struct camss_format_info formats_pix_8280xp[] = {
+	{ MEDIA_BUS_FMT_SBGGR8_1X8, 8, V4L2_PIX_FMT_SBGGR8, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 8) },
+	{ MEDIA_BUS_FMT_SGBRG8_1X8, 8, V4L2_PIX_FMT_SGBRG8, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 8) },
+	{ MEDIA_BUS_FMT_SGRBG8_1X8, 8, V4L2_PIX_FMT_SGRBG8, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 8) },
+	{ MEDIA_BUS_FMT_SRGGB8_1X8, 8, V4L2_PIX_FMT_SRGGB8, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 8) },
+	{ MEDIA_BUS_FMT_SBGGR10_1X10, 10, V4L2_PIX_FMT_SBGGR10P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 10) },
+	{ MEDIA_BUS_FMT_SGBRG10_1X10, 10, V4L2_PIX_FMT_SGBRG10P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 10) },
+	{ MEDIA_BUS_FMT_SGRBG10_1X10, 10, V4L2_PIX_FMT_SGRBG10P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 10) },
+	{ MEDIA_BUS_FMT_SRGGB10_1X10, 10, V4L2_PIX_FMT_SRGGB10P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 10) },
+	{ MEDIA_BUS_FMT_SBGGR12_1X12, 12, V4L2_PIX_FMT_SBGGR12P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 12) },
+	{ MEDIA_BUS_FMT_SGBRG12_1X12, 12, V4L2_PIX_FMT_SGBRG12P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 12) },
+	{ MEDIA_BUS_FMT_SGRBG12_1X12, 12, V4L2_PIX_FMT_SGRBG12P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 12) },
+	{ MEDIA_BUS_FMT_SRGGB12_1X12, 12, V4L2_PIX_FMT_SRGGB12P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 12) },
+	{ MEDIA_BUS_FMT_SBGGR14_1X14, 14, V4L2_PIX_FMT_SBGGR14P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 14) },
+	{ MEDIA_BUS_FMT_SGBRG14_1X14, 14, V4L2_PIX_FMT_SGBRG14P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 14) },
+	{ MEDIA_BUS_FMT_SGRBG14_1X14, 14, V4L2_PIX_FMT_SGRBG14P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 14) },
+	{ MEDIA_BUS_FMT_SRGGB14_1X14, 14, V4L2_PIX_FMT_SRGGB14P, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 14) },
+};
+
+/* YUV 4:2:0 output of the SC8280XP IFE pixel pipeline (FULL Y/C masters) */
+static const struct camss_format_info formats_pix_out_8280xp[] = {
+	{ MEDIA_BUS_FMT_YUYV8_1_5X8, 8, V4L2_PIX_FMT_NV12, 1,
+	  PER_PLANE_DATA(0, 1, 1, 2, 3, 8) },
+	{ MEDIA_BUS_FMT_YVYU8_1_5X8, 8, V4L2_PIX_FMT_NV21, 1,
+	  PER_PLANE_DATA(0, 1, 1, 2, 3, 8) },
+};
+
+const struct camss_formats vfe_formats_pix_8280xp = {
+	.nformats = ARRAY_SIZE(formats_pix_8280xp),
+	.formats = formats_pix_8280xp
+};
+
+const struct camss_formats vfe_formats_pix_out_8280xp = {
+	.nformats = ARRAY_SIZE(formats_pix_out_8280xp),
+	.formats = formats_pix_out_8280xp
+};
+
+/*
+ * vfe_pix_out_code - Pick a source pad code of a pixel pipeline
+ * @vfe: VFE device
+ * @index: index of the requested code, used if @req_code is 0
+ * @req_code: requested code
+ *
+ * The source codes do not depend on the Bayer order of the sink.
+ *
+ * Return a media bus code or 0 if @index is out of range
+ */
+static u32 vfe_pix_out_code(struct vfe_device *vfe, unsigned int index,
+			    u32 req_code)
+{
+	const struct camss_formats *out = vfe->res->formats_pix_out;
+	unsigned int i, j, n = 0;
+
+	if (req_code) {
+		for (i = 0; i < out->nformats; i++)
+			if (out->formats[i].code == req_code)
+				return req_code;
+
+		return out->formats[0].code;
+	}
+
+	for (i = 0; i < out->nformats; i++) {
+		for (j = 0; j < i; j++)
+			if (out->formats[j].code == out->formats[i].code)
+				break;
+		if (j < i)
+			continue;
+		if (n++ == index)
+			return out->formats[i].code;
+	}
+
+	return 0;
+}
+
 static u32 vfe_src_pad_code(struct vfe_line *line, u32 sink_code,
 			    unsigned int index, u32 src_req_code)
 {
 	struct vfe_device *vfe = to_vfe(line);
+
+	if (vfe_line_has_pix_pipeline(vfe, line->id))
+		return vfe_pix_out_code(vfe, index, src_req_code);
 
 	switch (vfe->camss->res->version) {
 	case CAMSS_8x16:
@@ -538,6 +633,9 @@ int vfe_enable_output_v2(struct vfe_line *line)
 	WARN_ON(output->gen2.active_num);
 
 	output->state = VFE_OUTPUT_ON;
+	output->armed_next = false;
+	output->armed_ahead = false;
+	output->error = false;
 
 	output->sequence = 0;
 	output->wait_reg_update = 0;
@@ -560,6 +658,26 @@ int vfe_enable_output_v2(struct vfe_line *line)
 	return 0;
 }
 
+/* As vfe_queue_buffer_v2(), with the output lock held */
+void vfe_queue_buffer_v2_locked(struct vfe_line *line, struct camss_buffer *buf)
+{
+	struct vfe_device *vfe = to_vfe(line);
+	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
+	struct vfe_output *output = &line->output;
+
+	lockdep_assert_held(&vfe->output_lock);
+
+	if (output->state == VFE_OUTPUT_ON &&
+	    output->gen2.active_num < 2) {
+		output->buf[output->gen2.active_num++] = buf;
+		ops->vfe_wm_update(vfe, output->wm_idx[0],
+				   buf->addr[0], line);
+		ops->reg_update(vfe, line->id);
+	} else {
+		vfe_buf_add_pending(output, buf);
+	}
+}
+
 /*
  * vfe_queue_buffer_v2 - Add empty buffer
  * @vid: Video device structure
@@ -575,24 +693,10 @@ int vfe_queue_buffer_v2(struct camss_video *vid,
 {
 	struct vfe_line *line = container_of(vid, struct vfe_line, video_out);
 	struct vfe_device *vfe = to_vfe(line);
-	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
-	struct vfe_output *output;
 	unsigned long flags;
 
-	output = &line->output;
-
 	spin_lock_irqsave(&vfe->output_lock, flags);
-
-	if (output->state == VFE_OUTPUT_ON &&
-	    output->gen2.active_num < 2) {
-		output->buf[output->gen2.active_num++] = buf;
-		ops->vfe_wm_update(vfe, output->wm_idx[0],
-				   buf->addr[0], line);
-		ops->reg_update(vfe, line->id);
-	} else {
-		vfe_buf_add_pending(output, buf);
-	}
-
+	vfe_queue_buffer_v2_locked(line, buf);
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
 
 	return 0;
@@ -814,14 +918,22 @@ static int vfe_disable_output(struct vfe_line *line)
 	struct vfe_output *output = &line->output;
 	unsigned long flags;
 	unsigned int i;
+	bool last;
 
 	spin_lock_irqsave(&vfe->output_lock, flags);
 	for (i = 0; i < output->wm_num; i++)
 		vfe->res->hw_ops->vfe_wm_stop(vfe, output->wm_idx[i]);
 	output->gen2.active_num = 0;
+	/* No more buffers go in, such as at the pixel path's epochs */
+	output->state = VFE_OUTPUT_STOPPING;
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
 
-	return vfe_reset(vfe);
+	/* The reset stops every line of the VFE: leave it to the last one */
+	mutex_lock(&vfe->stream_lock);
+	last = vfe->stream_count == 1;
+	mutex_unlock(&vfe->stream_lock);
+
+	return last ? vfe_reset(vfe) : 0;
 }
 
 /*
@@ -939,6 +1051,47 @@ static bool vfe_check_clock_levels(struct camss_clock *clock)
 }
 
 /*
+ * vfe_min_clock_rate - The lowest rate of a VFE clock for its lines
+ *
+ * The VFE core clocks a pixel of the pixel path per cycle, and the data of
+ * an RDI line in 64 bit words: the rate the busiest line needs. The camera
+ * NoC carries the data of all lines to memory: the sum of their rates, the
+ * pixel path counted at 16 bits per pixel, the most it writes. Both with the
+ * clock margin.
+ */
+static u64 vfe_min_clock_rate(struct vfe_device *vfe, struct camss_clock *clock,
+			      const u64 *pixel_clock)
+{
+	bool noc = !strcmp(clock->name, "camnoc_axi") ||
+		   !strcmp(clock->name, "camnoc_rt_axi");
+	u64 min_rate = 0;
+	int j;
+
+	for (j = VFE_LINE_RDI0; j < vfe->res->line_num; j++) {
+		u64 tmp;
+
+		if (j == VFE_LINE_PIX) {
+			tmp = noc ? pixel_clock[j] * 16 / 64 : pixel_clock[j];
+		} else {
+			struct vfe_line *l = &vfe->line[j];
+			u8 bpp = camss_format_get_bpp(l->formats, l->nformats,
+						      l->fmt[MSM_VFE_PAD_SINK].code);
+
+			tmp = pixel_clock[j] * bpp / 64;
+		}
+
+		if (noc)
+			min_rate += tmp;
+		else if (min_rate < tmp)
+			min_rate = tmp;
+	}
+
+	camss_add_clock_margin(&min_rate);
+
+	return min_rate;
+}
+
+/*
  * vfe_set_clock_rates - Calculate and set clock rates on VFE module
  * @vfe: VFE device
  *
@@ -962,29 +1115,8 @@ static int vfe_set_clock_rates(struct vfe_device *vfe)
 		struct camss_clock *clock = &vfe->clock[i];
 
 		if (vfe_match_clock_names(vfe, clock) && vfe_check_clock_levels(clock)) {
-			u64 min_rate = 0;
+			u64 min_rate = vfe_min_clock_rate(vfe, clock, pixel_clock);
 			long rate;
-
-			for (j = VFE_LINE_RDI0; j < vfe->res->line_num; j++) {
-				u32 tmp;
-				u8 bpp;
-
-				if (j == VFE_LINE_PIX) {
-					tmp = pixel_clock[j];
-				} else {
-					struct vfe_line *l = &vfe->line[j];
-
-					bpp = camss_format_get_bpp(l->formats,
-								   l->nformats,
-								   l->fmt[MSM_VFE_PAD_SINK].code);
-					tmp = pixel_clock[j] * bpp / 64;
-				}
-
-				if (min_rate < tmp)
-					min_rate = tmp;
-			}
-
-			camss_add_clock_margin(&min_rate);
 
 			for (j = 0; j < clock->nfreqs; j++)
 				if (min_rate < clock->freq[j])
@@ -1029,7 +1161,7 @@ static int vfe_set_clock_rates(struct vfe_device *vfe)
 static int vfe_check_clock_rates(struct vfe_device *vfe)
 {
 	u64 pixel_clock[VFE_LINE_NUM_MAX];
-	int i, j;
+	int i;
 	int ret;
 
 	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++) {
@@ -1043,29 +1175,8 @@ static int vfe_check_clock_rates(struct vfe_device *vfe)
 		struct camss_clock *clock = &vfe->clock[i];
 
 		if (vfe_match_clock_names(vfe, clock) && vfe_check_clock_levels(clock)) {
-			u64 min_rate = 0;
+			u64 min_rate = vfe_min_clock_rate(vfe, clock, pixel_clock);
 			unsigned long rate;
-
-			for (j = VFE_LINE_RDI0; j < vfe->res->line_num; j++) {
-				u32 tmp;
-				u8 bpp;
-
-				if (j == VFE_LINE_PIX) {
-					tmp = pixel_clock[j];
-				} else {
-					struct vfe_line *l = &vfe->line[j];
-
-					bpp = camss_format_get_bpp(l->formats,
-								   l->nformats,
-								   l->fmt[MSM_VFE_PAD_SINK].code);
-					tmp = pixel_clock[j] * bpp / 64;
-				}
-
-				if (min_rate < tmp)
-					min_rate = tmp;
-			}
-
-			camss_add_clock_margin(&min_rate);
 
 			rate = clk_get_rate(clock->clk);
 			if (rate < min_rate)
@@ -1127,7 +1238,7 @@ int vfe_get(struct vfe_device *vfe)
 	return 0;
 
 error_reset:
-	camss_disable_clocks(vfe->nclocks, vfe->clock);
+	camss_disable_clocks(vfe->nclocks, vfe->clock, vfe->camss->dev);
 
 error_pm_runtime_get:
 	pm_runtime_put_sync(vfe->camss->dev);
@@ -1156,7 +1267,7 @@ void vfe_put(struct vfe_device *vfe)
 			vfe->was_streaming = 0;
 			vfe->res->hw_ops->vfe_halt(vfe);
 		}
-		camss_disable_clocks(vfe->nclocks, vfe->clock);
+		camss_disable_clocks(vfe->nclocks, vfe->clock, vfe->camss->dev);
 		pm_runtime_put_sync(vfe->camss->dev);
 		vfe->res->hw_ops->pm_domain_off(vfe);
 	}
@@ -1165,6 +1276,63 @@ void vfe_put(struct vfe_device *vfe)
 
 exit:
 	mutex_unlock(&vfe->power_lock);
+}
+
+
+/*
+ * vfe_line_fatal_error - The VFE a line belongs to is wedged
+ * @line: VFE line
+ *
+ * Its streams produce nothing more until restarted: the queues report the
+ * error to userspace, which stops and starts them again. Interrupt context.
+ */
+void vfe_line_fatal_error(struct vfe_line *line)
+{
+	struct vfe_device *vfe = to_vfe(line);
+
+	if (vfe->res->hw_ops->fatal_error)
+		vfe->res->hw_ops->fatal_error(vfe);
+}
+
+/*
+ * vfe_line_running - Whether a line takes frames: streaming, and for the pixel
+ * path not stopping. Interrupt context, by the CSID feeding it.
+ */
+bool vfe_line_running(struct vfe_line *line)
+{
+	struct vfe_device *vfe = to_vfe(line);
+	unsigned long flags;
+	bool running;
+
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	running = line->output.state == VFE_OUTPUT_ON &&
+		  !(line->id == VFE_LINE_PIX && vfe->pix_stopping);
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
+
+	return running;
+}
+
+/*
+ * vfe_line_frame_error - The frame a line is writing came in corrupt
+ * @line: VFE line
+ *
+ * Its buffer completes with VB2_BUF_STATE_ERROR; a dual IFE slave passes
+ * it on to the master's buffer with its stripe. Called in interrupt context,
+ * by the VFE and by the CSID feeding it. The pixel line's frame is also the
+ * frame of its display output.
+ */
+void vfe_line_frame_error(struct vfe_line *line)
+{
+	struct vfe_device *vfe = to_vfe(line);
+	unsigned long flags;
+
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	if (line->output.state == VFE_OUTPUT_ON)
+		line->output.error = true;
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
+
+	if (line->id == VFE_LINE_PIX && vfe->res->hw_ops->pix_frame_error)
+		vfe->res->hw_ops->pix_frame_error(vfe);
 }
 
 /*
@@ -1196,6 +1364,11 @@ int vfe_flush_buffers(struct camss_video *vid,
 
 	if (output->buf[1])
 		vb2_buffer_done(&output->buf[1]->vb.vb2_buf, state);
+
+	/* No stale pointers for a later start that arms fewer buffers */
+	output->buf[0] = NULL;
+	output->buf[1] = NULL;
+	output->gen2.active_num = 0;
 
 	if (output->last_buffer) {
 		vb2_buffer_done(&output->last_buffer->vb.vb2_buf, state);
@@ -1349,7 +1522,8 @@ static void vfe_try_format(struct vfe_line *line,
 
 		/* If not found, use UYVY as default */
 		if (i >= line->nformats)
-			fmt->code = MEDIA_BUS_FMT_UYVY8_1X16;
+			fmt->code = vfe_line_has_pix_pipeline(to_vfe(line), line->id) ?
+				    line->formats[0].code : MEDIA_BUS_FMT_UYVY8_1X16;
 
 		fmt->width = clamp_t(u32, fmt->width, 1, 8191);
 		fmt->height = clamp_t(u32, fmt->height, 1, 8191);
@@ -1420,6 +1594,10 @@ static void vfe_try_compose(struct vfe_line *line,
 
 	if (rect->height < 4)
 		rect->height = 4;
+
+	/* The chroma scaler halves the compose size for YUV 4:2:0 */
+	if (vfe_line_has_pix_pipeline(to_vfe(line), line->id))
+		rect->height &= ~0x1;
 }
 
 /*
@@ -1453,6 +1631,13 @@ static void vfe_try_crop(struct vfe_line *line,
 	/* wm in line based mode writes multiple of 16 horizontally */
 	rect->left += (rect->width & 0xf) >> 1;
 	rect->width &= ~0xf;
+
+	/* Keep the crop window on chroma sample boundaries for YUV 4:2:0 */
+	if (vfe_line_has_pix_pipeline(to_vfe(line), line->id)) {
+		rect->left &= ~0x1;
+		rect->top &= ~0x1;
+		rect->height &= ~0x1;
+	}
 
 	if (rect->width < 16) {
 		rect->left = 0;
@@ -1959,6 +2144,14 @@ static int vfe_link_setup(struct media_entity *entity,
 			  const struct media_pad *local,
 			  const struct media_pad *remote, u32 flags)
 {
+	/*
+	 * Besides its own video node, a pixel path output may feed the video
+	 * node of another pixel path (dual IFE) and the display output of its
+	 * VFE.
+	 */
+	if (local->flags & MEDIA_PAD_FL_SOURCE)
+		return 0;
+
 	if (flags & MEDIA_LNK_FL_ENABLED)
 		if (media_pad_remote_pad_first(local))
 			return -EBUSY;
@@ -1966,8 +2159,23 @@ static int vfe_link_setup(struct media_entity *entity,
 	return 0;
 }
 
+/*
+ * Frame sync events, on the lines whose hardware support code sets
+ * V4L2_SUBDEV_FL_HAS_EVENTS
+ */
+static int vfe_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
+			       struct v4l2_event_subscription *sub)
+{
+	if (sub->type != V4L2_EVENT_FRAME_SYNC)
+		return -EINVAL;
+
+	return v4l2_event_subscribe(fh, sub, 0, NULL);
+}
+
 static const struct v4l2_subdev_core_ops vfe_core_ops = {
 	.s_power = vfe_set_power,
+	.subscribe_event = vfe_subscribe_event,
+	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
 };
 
 static const struct v4l2_subdev_video_ops vfe_video_ops = {
@@ -2117,6 +2325,10 @@ int msm_vfe_register_entities(struct vfe_device *vfe,
 
 		video_out->nformats = vfe->line[i].nformats;
 		video_out->formats = vfe->line[i].formats;
+		if (vfe_line_has_pix_pipeline(vfe, i)) {
+			video_out->nformats = vfe->res->formats_pix_out->nformats;
+			video_out->formats = vfe->res->formats_pix_out->formats;
+		}
 
 		snprintf(name, ARRAY_SIZE(name), "%s%d_%s%d",
 			 MSM_VFE_NAME, vfe->id, "video", i);
@@ -2137,6 +2349,14 @@ int msm_vfe_register_entities(struct vfe_device *vfe,
 				ret);
 			goto error_link;
 		}
+	}
+
+	if (vfe->res->hw_ops->meta_register && vfe->res->line_num > VFE_LINE_PIX &&
+	    vfe_line_has_pix_pipeline(vfe, VFE_LINE_PIX)) {
+		ret = vfe->res->hw_ops->meta_register(vfe, v4l2_dev);
+		if (ret < 0)
+			dev_warn(dev, "VFE%d: no parameters/statistics nodes: %d\n",
+				 vfe->id, ret);
 	}
 
 	return 0;
@@ -2170,6 +2390,9 @@ error_init:
 void msm_vfe_unregister_entities(struct vfe_device *vfe)
 {
 	int i;
+
+	if (vfe->res->hw_ops->meta_unregister)
+		vfe->res->hw_ops->meta_unregister(vfe);
 
 	mutex_destroy(&vfe->power_lock);
 	mutex_destroy(&vfe->stream_lock);

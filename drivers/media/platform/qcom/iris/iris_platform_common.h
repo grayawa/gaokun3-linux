@@ -55,6 +55,7 @@ extern const struct iris_firmware_data iris_hfi_gen2_data;
 
 extern const struct iris_platform_data qcs8300_data;
 extern const struct iris_platform_data sc7280_data;
+extern const struct iris_platform_data sc8280xp_data;
 extern const struct iris_platform_data sm8250_data;
 extern const struct iris_platform_data sm8550_data;
 extern const struct iris_platform_data sm8650_data;
@@ -127,6 +128,7 @@ enum platform_inst_fw_cap_type {
 	TIER,
 	HEADER_MODE,
 	PREPEND_SPSPPS_TO_IDR,
+	REQUEST_I_FRAME,
 	BITRATE,
 	BITRATE_PEAK,
 	BITRATE_MODE,
@@ -134,6 +136,12 @@ enum platform_inst_fw_cap_type {
 	FRAME_RC_ENABLE,
 	GOP_SIZE,
 	ENTROPY_MODE,
+	DEBLOCK_MODE_H264,
+	DEBLOCK_ALPHA_H264,
+	DEBLOCK_BETA_H264,
+	DEBLOCK_MODE_HEVC,
+	DEBLOCK_TC_HEVC,
+	DEBLOCK_BETA_HEVC,
 	MIN_FRAME_QP_H264,
 	MIN_FRAME_QP_HEVC,
 	MAX_FRAME_QP_H264,
@@ -182,6 +190,9 @@ enum platform_inst_fw_cap_type {
 	LAYER3_BITRATE_HEVC,
 	LAYER4_BITRATE_HEVC,
 	LAYER5_BITRATE_HEVC,
+	DISPLAY_DELAY_ENABLE,
+	DISPLAY_DELAY,
+	TIME_DELTA_BASED_RC,
 	INST_FW_CAP_MAX,
 };
 
@@ -288,11 +299,7 @@ struct iris_firmware_desc {
 };
 
 struct iris_platform_data {
-	/*
-	 * XXX: replace with gen1 / gen2 pointers once we have platforms
-	 * supporting both firmware kinds.
-	 */
-	const struct iris_firmware_desc *firmware_desc;
+	const struct iris_firmware_desc *firmware_desc_gen1, *firmware_desc_gen2;
 
 	const struct vpu_ops *vpu_ops;
 	const struct icc_info *icc_tbl;
@@ -317,6 +324,7 @@ struct iris_platform_data {
 	const struct tz_cp_config *tz_cp_config_data;
 	u32 tz_cp_config_data_size;
 	u32 num_vpp_pipe;
+	bool prepend_sps_pps_to_idr;
 	bool no_aon;
 	u32 max_session_count;
 	/* max number of macroblocks per frame supported */

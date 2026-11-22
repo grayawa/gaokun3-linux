@@ -23,6 +23,7 @@
 #include "dpu_hw_top.h"
 #include "dpu_rm.h"
 #include "dpu_core_perf.h"
+#include "dpu_panel_cal.h"
 
 #define DRMID(x) ((x) ? (x)->base.id : -1)
 
@@ -80,6 +81,10 @@ struct dpu_kms {
 	struct drm_private_obj global_state;
 
 	struct dpu_rm rm;
+
+	/* factory calibration of the built-in panel, see dpu_panel_cal.c */
+	struct dpu_hw_gamut_lut *panel_lut;
+	bool has_panel_cal;
 
 	struct dpu_hw_vbif *hw_vbif;
 	struct dpu_hw_mdp *hw_mdp;

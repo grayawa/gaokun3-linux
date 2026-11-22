@@ -24,6 +24,12 @@
 #include "../../pci.h"
 #include "pcie-designware.h"
 
+/*
+ * Time a slot stays off when its link is retried on resume. The deinit hook
+ * may remove the slot supply, and the SSD's minimum off time isn't documented.
+ */
+#define DW_PCIE_RESUME_RETRY_OFF_MS	3000
+
 static struct pci_ops dw_pcie_ops;
 static struct pci_ops dw_pcie_ecam_ops;
 static struct pci_ops dw_child_pcie_ops;
@@ -734,6 +740,9 @@ static void __iomem *dw_pcie_other_conf_map_bus(struct pci_bus *bus,
 	int type, ret;
 	u32 busdev;
 
+	if (READ_ONCE(pp->cfg_access_blocked))
+		return NULL;
+
 	/*
 	 * Checking whether the link is up here is a last line of defense
 	 * against platforms that forward errors on the system bus as
@@ -828,6 +837,9 @@ void __iomem *dw_pcie_own_conf_map_bus(struct pci_bus *bus, unsigned int devfn, 
 	struct dw_pcie_rp *pp = bus->sysdata;
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 
+	if (READ_ONCE(pp->cfg_access_blocked))
+		return NULL;
+
 	if (PCI_SLOT(devfn) > 0)
 		return NULL;
 
@@ -841,6 +853,9 @@ static void __iomem *dw_pcie_ecam_conf_map_bus(struct pci_bus *bus, unsigned int
 	struct dw_pcie_rp *pp = cfg->priv;
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 	unsigned int busn = bus->number;
+
+	if (READ_ONCE(pp->cfg_access_blocked))
+		return NULL;
 
 	if (busn > 0)
 		return pci_ecam_map_bus(bus, devfn, where);
@@ -1220,17 +1235,59 @@ static int dw_pcie_pme_turn_off(struct dw_pcie *pci)
 	return 0;
 }
 
+/*
+ * Return the requester ID of a PME that the Root Port received and nothing has
+ * handled, or -1. For system suspend, pcie_pme_suspend() turns the PME
+ * interrupt off unless it can wake the system, which an MSI through a GIC ITS
+ * can't. The PCI core clears the bit on resume, see
+ * pcie_pme_root_status_cleanup().
+ */
+static int dw_pcie_pme_received(struct dw_pcie *pci)
+{
+	u8 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
+	u32 val = dw_pcie_readl_dbi(pci, offset + PCI_EXP_RTSTA);
+
+	if (PCI_POSSIBLE_ERROR(val) || !(val & PCI_EXP_RTSTA_PME))
+		return -1;
+
+	return FIELD_GET(PCI_EXP_RTSTA_PME_RQ_ID, val);
+}
+
 int dw_pcie_suspend_noirq(struct dw_pcie *pci)
 {
 	bool pme_capable = false;
-	int ret = 0;
+	int ret = 0, rid;
 	u32 val;
 
-	if (!dw_pcie_link_up(pci))
+	pci->link_up_at_suspend = dw_pcie_link_up(pci);
+	if (!pci->link_up_at_suspend)
 		goto stop_link;
 
 	if (!pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable))
 		return 0;
+
+	/*
+	 * A device has asked to wake the system. Turning the link off now
+	 * races with that: an endpoint that has just sent PME may never
+	 * acknowledge PME_Turn_Off, and powering it down regardless can leave
+	 * it unable to bring the link back. Abort the suspend instead, and
+	 * report the wakeup on the device as the PME service would have.
+	 */
+	rid = dw_pcie_pme_received(pci);
+	if (rid >= 0) {
+		int domain = pci_domain_nr(pci->pp.bridge->bus);
+		struct pci_dev *pdev;
+
+		pdev = pci_get_domain_bus_and_slot(domain, PCI_BUS_NUM(rid),
+						   rid & 0xff);
+		if (pdev) {
+			pci_wakeup_event(pdev);
+			pci_dev_put(pdev);
+		}
+		dev_info(pci->dev, "PME from %02x:%02x.%d, aborting suspend\n",
+			 PCI_BUS_NUM(rid), PCI_SLOT(rid), PCI_FUNC(rid));
+		return -EBUSY;
+	}
 
 	if (pci->pp.ops->pme_turn_off) {
 		pci->pp.ops->pme_turn_off(&pci->pp);
@@ -1294,11 +1351,13 @@ EXPORT_SYMBOL_GPL(dw_pcie_suspend_noirq);
 
 int dw_pcie_resume_noirq(struct dw_pcie *pci)
 {
+	bool retry = pci->link_up_at_suspend;
 	int ret;
 
 	if (!pci->suspended)
 		return 0;
 
+bring_up:
 	if (pci->pp.ops->init) {
 		ret = pci->pp.ops->init(&pci->pp);
 		if (ret) {
@@ -1314,18 +1373,36 @@ int dw_pcie_resume_noirq(struct dw_pcie *pci)
 		goto err_deinit;
 
 	ret = dw_pcie_wait_for_link(pci);
-	if (ret == -ETIMEDOUT)
-		goto err_stop_link;
 
+	/*
+	 * The endpoint had a link before the suspend, so it should still be
+	 * there, and nothing below the Root Port has been resumed yet. Take the
+	 * slot down once more before giving up on it.
+	 */
+	if (ret && retry) {
+		dev_warn(pci->dev, "Link didn't come back (%d), taking the slot down\n",
+			 ret);
+		retry = false;
+		dw_pcie_stop_link(pci);
+		if (pci->pp.ops->deinit)
+			pci->pp.ops->deinit(&pci->pp);
+		msleep(DW_PCIE_RESUME_RETRY_OFF_MS);
+		goto bring_up;
+	}
+
+	/*
+	 * The PM core resumes the Root Port and its children whatever happens
+	 * here, and they reach the controller through the DBI. Keep the host
+	 * up if the link failed: config accesses to the children fail at the
+	 * link check in dw_pcie_other_conf_map_bus(), while tearing the host
+	 * down would leave the DBI unclocked.
+	 */
 	if (pci->pp.ops->post_init)
 		pci->pp.ops->post_init(&pci->pp);
 
 	pci->suspended = false;
 
 	return 0;
-
-err_stop_link:
-	dw_pcie_stop_link(pci);
 
 err_deinit:
 	if (pci->pp.ops->deinit)

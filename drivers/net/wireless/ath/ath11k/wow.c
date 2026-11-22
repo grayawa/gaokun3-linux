@@ -739,6 +739,8 @@ int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
 		return ret;
 	}
 
+	rings_ready = ath11k_wow_rings_ready(ar->ab);
+
 	mutex_lock(&ar->conf_mutex);
 
 	/*

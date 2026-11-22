@@ -175,6 +175,9 @@ struct dpu_crtc {
 	struct dpu_crtc_frame_event frame_events[DPU_CRTC_FRAME_EVENT_SIZE];
 	struct list_head frame_event_list;
 	spinlock_t spin_lock;
+
+	/* 3D LUT bank of the panel calibration in use, -1 for none */
+	int gamut_bank;
 	struct completion frame_done_comp;
 
 	/* for handling internal event thread */
