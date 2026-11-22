@@ -42,6 +42,10 @@
 /* timeout in ms waiting for frame done */
 #define DPU_CRTC_FRAME_DONE_TIMEOUT_MS	60
 
+static bool panel_calibration = true;
+MODULE_PARM_DESC(panel_calibration, "Apply the factory sRGB calibration of the built-in panel");
+module_param(panel_calibration, bool, 0644);
+
 static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
 {
 	struct msm_drm_private *priv = crtc->dev->dev_private;
@@ -788,6 +792,31 @@ static int _dpu_crtc_check_and_setup_lm_bounds(struct drm_crtc *crtc,
 	return 0;
 }
 
+static bool _dpu_crtc_has_panel_cal(struct drm_crtc_state *state)
+{
+	struct drm_crtc *crtc = state->crtc;
+	struct dpu_kms *dpu_kms = _dpu_crtc_get_kms(crtc);
+	struct drm_encoder *encoder;
+
+	if (!dpu_kms->has_panel_cal)
+		return false;
+
+	drm_for_each_encoder_mask(encoder, crtc->dev, state->encoder_mask) {
+		if (encoder->encoder_type == DRM_MODE_ENCODER_DSI)
+			return true;
+	}
+
+	return false;
+}
+
+static int _dpu_crtc_panel_bank(struct drm_crtc_state *state)
+{
+	if (_dpu_crtc_has_panel_cal(state) && READ_ONCE(panel_calibration))
+		return DPU_PANEL_CAL_SRGB;
+
+	return -1;
+}
+
 static u32 _dpu_crtc_pcc_s3_15(s64 val)
 {
 	return clamp_t(s64, val, -BIT(17), BIT(17) - 1) & GENMASK(17, 0);
@@ -857,14 +886,19 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	struct drm_crtc_state *state = crtc->state;
 	struct dpu_crtc_state *cstate = to_dpu_crtc_state(crtc->state);
 	struct dpu_crtc_mixer *mixer = cstate->mixers;
+	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
+	struct dpu_kms *dpu_kms = _dpu_crtc_get_kms(crtc);
+	bool modeset = drm_atomic_crtc_needs_modeset(state);
+	int bank = _dpu_crtc_panel_bank(state);
 	struct dpu_hw_pcc_cfg cfg;
 	struct dpu_hw_gc_lut *gc_lut;
 	struct dpu_hw_ctl *ctl;
 	struct dpu_hw_dspp *dspp;
 	int i;
 
-
-	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state))
+	/* DSPPs change only along with color_mgmt_changed or a modeset */
+	if (!state->color_mgmt_changed && !modeset &&
+	    bank == dpu_crtc->gamut_bank)
 		return;
 
 	for (i = 0; i < cstate->num_mixers; i++) {
@@ -873,6 +907,19 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 
 		if (!dspp)
 			continue;
+
+		if (dspp->ops.select_gamut && state->active) {
+			if (modeset)
+				dspp->gamut_loaded = false;
+			if (bank >= 0 && !dspp->gamut_loaded) {
+				dspp->ops.load_gamut(dspp, DPU_PANEL_CAL_SRGB,
+					&dpu_kms->panel_lut[DPU_PANEL_CAL_SRGB]);
+				dspp->gamut_loaded = true;
+			}
+			dspp->ops.select_gamut(dspp, bank);
+			ctl->ops.update_pending_flush_dspp(ctl,
+				mixer[i].hw_dspp->idx, DPU_DSPP_GAMUT);
+		}
 
 		if (dspp->ops.setup_pcc) {
 			if (!state->ctm) {
@@ -904,6 +951,8 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 				mixer[i].hw_dspp->idx, DPU_DSPP_GC);
 		}
 	}
+
+	dpu_crtc->gamut_bank = bank;
 }
 
 static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
@@ -1431,7 +1480,8 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	else
 		topology.num_lm = 1;
 
-	if (crtc_state->ctm || crtc_state->gamma_lut)
+	if (crtc_state->ctm || crtc_state->gamma_lut ||
+	    _dpu_crtc_has_panel_cal(crtc_state))
 		topology.num_dspp = topology.num_lm;
 
 	return topology;
@@ -1451,16 +1501,20 @@ static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
 	int ret;
 
 	/*
-	 * Release and Allocate resources on every modeset
+	 * When disabling a CRTC, release all its hardware resources.
+	 * When re-reserving for an enabled CRTC (e.g. during modeset),
+	 * do NOT release first — dpu_rm_reserve will prefer the existing
+	 * assignment, preventing unnecessary block migration that can
+	 * break vblank IRQ registration.
 	 */
 	global_state = dpu_kms_get_global_state(crtc_state->state);
 	if (IS_ERR(global_state))
 		return PTR_ERR(global_state);
 
-	dpu_rm_release(global_state, crtc);
-
-	if (!crtc_state->enable)
+	if (!crtc_state->enable) {
+		dpu_rm_release(global_state, crtc);
 		return 0;
+	}
 
 	topology = dpu_crtc_get_topology(crtc, dpu_kms, crtc_state);
 	ret = dpu_rm_reserve(&dpu_kms->rm, global_state,
@@ -1905,6 +1959,7 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
 
 	spin_lock_init(&dpu_crtc->spin_lock);
 	atomic_set(&dpu_crtc->frame_pending, 0);
+	dpu_crtc->gamut_bank = -1;
 
 	init_completion(&dpu_crtc->frame_done_comp);
 

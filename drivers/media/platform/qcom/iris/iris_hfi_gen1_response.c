@@ -107,9 +107,33 @@ static void iris_hfi_gen1_read_changed_params(struct iris_inst *inst,
 	pixmp_ip->width = event.width;
 	pixmp_ip->height = event.height;
 
-	pixmp_op->width = ALIGN(event.width, 128);
-	pixmp_op->height = ALIGN(event.height, 32);
-	pixmp_op->plane_fmt[0].bytesperline = ALIGN(event.width, 128);
+	if (event.bit_depth == HFI_BITDEPTH_10) {
+		inst->fw_caps[BIT_DEPTH].value = BIT_DEPTH_10;
+		if (!iris_fmt_is_10bit(pixmp_op->pixelformat))
+			pixmp_op->pixelformat = V4L2_PIX_FMT_P010;
+	} else {
+		inst->fw_caps[BIT_DEPTH].value = BIT_DEPTH_8;
+		if (!iris_fmt_is_8bit(pixmp_op->pixelformat))
+			pixmp_op->pixelformat = V4L2_PIX_FMT_NV12;
+	}
+
+	switch (pixmp_op->pixelformat) {
+	case V4L2_PIX_FMT_P010:
+		pixmp_op->width = ALIGN(event.width, 128);
+		pixmp_op->height = ALIGN(event.height, 32);
+		pixmp_op->plane_fmt[0].bytesperline = ALIGN(event.width * 2, 256);
+		break;
+	case V4L2_PIX_FMT_QC10C:
+		pixmp_op->width = roundup(event.width, 192);
+		pixmp_op->height = ALIGN(event.height, 16);
+		pixmp_op->plane_fmt[0].bytesperline = ALIGN(pixmp_op->width * 4 / 3, 256);
+		break;
+	default:
+		pixmp_op->width = ALIGN(event.width, 128);
+		pixmp_op->height = ALIGN(event.height, 32);
+		pixmp_op->plane_fmt[0].bytesperline = ALIGN(event.width, 128);
+		break;
+	}
 	pixmp_op->plane_fmt[0].sizeimage = iris_get_buffer_size(inst, BUF_OUTPUT);
 
 	matrix_coeff =  FIELD_GET(GENMASK(7, 0), event.colour_space);
@@ -166,7 +190,9 @@ static void iris_hfi_gen1_read_changed_params(struct iris_inst *inst,
 	dst_q = v4l2_m2m_get_dst_vq(inst->m2m_ctx);
 	dst_q->min_reqbufs_allocation = inst->buffers[BUF_OUTPUT].min_count;
 
-	if (event.bit_depth || !event.pic_struct) {
+	if ((event.bit_depth != HFI_BITDEPTH_8 && event.bit_depth != HFI_BITDEPTH_10) ||
+	    (event.bit_depth == HFI_BITDEPTH_10 && inst->codec == V4L2_PIX_FMT_H264) ||
+	    !event.pic_struct) {
 		dev_err(core->dev, "unsupported content, bit depth: %x, pic_struct = %x\n",
 			event.bit_depth, event.pic_struct);
 		iris_inst_change_state(inst, IRIS_INST_ERROR);
@@ -219,21 +245,17 @@ static void
 iris_hfi_gen1_sys_event_notify(struct iris_core *core, void *packet)
 {
 	struct hfi_msg_event_notify_pkt *pkt = packet;
-	struct iris_inst *instance;
 
-	if (pkt->event_id == HFI_EVENT_SYS_ERROR)
+	if (pkt->event_id == HFI_EVENT_SYS_ERROR) {
 		dev_err(core->dev, "sys error (type: %x, session id:%x, data1:%x, data2:%x)\n",
 			pkt->event_id, pkt->shdr.session_id, pkt->event_data1,
 			pkt->event_data2);
 
-	core->state = IRIS_CORE_ERROR;
+		iris_hfi_sfr_print(core);
+	}
 
-	mutex_lock(&core->lock);
-	list_for_each_entry(instance, &core->instances, list)
-		iris_inst_change_state(instance, IRIS_INST_ERROR);
-	mutex_unlock(&core->lock);
-
-	schedule_delayed_work(&core->sys_error_handler, msecs_to_jiffies(10));
+	if (iris_core_prepare_deinit(core))
+		schedule_delayed_work(&core->sys_error_handler, msecs_to_jiffies(10));
 }
 
 static void
@@ -426,14 +448,16 @@ static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
 	}
 
 	if ((hfi_flags & HFI_BUFFERFLAG_EOS) && !filled_len) {
-		reinit_completion(&inst->flush_completion);
+		if (inst->domain != DECODER || READ_ONCE(iris_eos_flush)) {
+			reinit_completion(&inst->flush_completion);
 
-		flush_pkt.shdr.hdr.size = sizeof(struct hfi_session_flush_pkt);
-		flush_pkt.shdr.hdr.pkt_type = HFI_CMD_SESSION_FLUSH;
-		flush_pkt.shdr.session_id = inst->session_id;
-		flush_pkt.flush_type = HFI_FLUSH_OUTPUT;
-		if (!iris_hfi_queue_cmd_write(core, &flush_pkt, flush_pkt.shdr.hdr.size))
-			inst->flush_responses_pending++;
+			flush_pkt.shdr.hdr.size = sizeof(struct hfi_session_flush_pkt);
+			flush_pkt.shdr.hdr.pkt_type = HFI_CMD_SESSION_FLUSH;
+			flush_pkt.shdr.session_id = inst->session_id;
+			flush_pkt.flush_type = HFI_FLUSH_OUTPUT;
+			if (!iris_hfi_queue_cmd_write(core, &flush_pkt, flush_pkt.shdr.hdr.size))
+				inst->flush_responses_pending++;
+		}
 
 		iris_inst_sub_state_change_drain_last(inst);
 	}

@@ -10,6 +10,11 @@
 #include "iris_hfi_common.h"
 #include "iris_vpu_common.h"
 
+struct iris_hfi_sfr {
+	u32 buf_size;
+	u8 data[];
+};
+
 u32 iris_hfi_get_v4l2_color_primaries(u32 hfi_primaries)
 {
 	switch (hfi_primaries) {
@@ -90,6 +95,27 @@ int iris_hfi_core_init(struct iris_core *core)
 	return hfi_ops->sys_interframe_powercollapse(core);
 }
 
+void iris_hfi_sfr_print(struct iris_core *core)
+{
+	struct iris_hfi_sfr *sfr = core->sfr_vaddr;
+	u32 size, data_size;
+
+	if (!sfr)
+		return;
+
+	size = sfr->buf_size;
+	if (size <= sizeof(*sfr))
+		return;
+
+	if (size > SFR_SIZE)
+		size = SFR_SIZE;
+
+	data_size = size - sizeof(*sfr);
+
+	dev_err_ratelimited(core->dev, "SFR message from FW: %.*s\n",
+			    (int)data_size, sfr->data);
+}
+
 irqreturn_t iris_hfi_isr(int irq, void *data)
 {
 	disable_irq_nosync(irq);
@@ -106,17 +132,6 @@ irqreturn_t iris_hfi_isr_handler(int irq, void *data)
 
 	mutex_lock(&core->lock);
 	if (!core->hw_powered) {
-		/*
-		 * The core was powered off while this thread waited for the lock
-		 * (every iris_vpu_power_off() caller holds core->lock). Its
-		 * registers may now be clock/power gated, and on this SoC even a
-		 * read of a gated block is a fatal external abort, so neither clear
-		 * the interrupt nor run the response handler (it can ring the
-		 * doorbell via iris_hfi_queue_cmd_write()). Keep the enable_irq()
-		 * below: it balances iris_hfi_isr()'s disable_irq_nosync(), while
-		 * iris_vpu_power_off()'s own disable keeps the line off until the
-		 * next power-on.
-		 */
 		mutex_unlock(&core->lock);
 		goto out;
 	}

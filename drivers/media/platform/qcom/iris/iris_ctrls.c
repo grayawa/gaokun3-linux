@@ -40,6 +40,8 @@ static enum platform_inst_fw_cap_type iris_get_cap_id(u32 id)
 		return HEADER_MODE;
 	case V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR:
 		return PREPEND_SPSPPS_TO_IDR;
+	case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
+		return REQUEST_I_FRAME;
 	case V4L2_CID_MPEG_VIDEO_BITRATE:
 		return BITRATE;
 	case V4L2_CID_MPEG_VIDEO_BITRATE_PEAK:
@@ -54,6 +56,18 @@ static enum platform_inst_fw_cap_type iris_get_cap_id(u32 id)
 		return GOP_SIZE;
 	case V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE:
 		return ENTROPY_MODE;
+	case V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_MODE:
+		return DEBLOCK_MODE_H264;
+	case V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_ALPHA:
+		return DEBLOCK_ALPHA_H264;
+	case V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_BETA:
+		return DEBLOCK_BETA_H264;
+	case V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE:
+		return DEBLOCK_MODE_HEVC;
+	case V4L2_CID_MPEG_VIDEO_HEVC_LF_TC_OFFSET_DIV2:
+		return DEBLOCK_TC_HEVC;
+	case V4L2_CID_MPEG_VIDEO_HEVC_LF_BETA_OFFSET_DIV2:
+		return DEBLOCK_BETA_HEVC;
 	case V4L2_CID_MPEG_VIDEO_H264_MIN_QP:
 		return MIN_FRAME_QP_H264;
 	case V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP:
@@ -154,6 +168,10 @@ static enum platform_inst_fw_cap_type iris_get_cap_id(u32 id)
 		return LAYER4_BITRATE_HEVC;
 	case V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L5_BR:
 		return LAYER5_BITRATE_HEVC;
+	case V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE:
+		return DISPLAY_DELAY_ENABLE;
+	case V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY:
+		return DISPLAY_DELAY;
 	default:
 		return INST_FW_CAP_MAX;
 	}
@@ -183,6 +201,8 @@ static u32 iris_get_v4l2_id(enum platform_inst_fw_cap_type cap_id)
 		return V4L2_CID_MPEG_VIDEO_HEADER_MODE;
 	case PREPEND_SPSPPS_TO_IDR:
 		return V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR;
+	case REQUEST_I_FRAME:
+		return V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME;
 	case BITRATE:
 		return V4L2_CID_MPEG_VIDEO_BITRATE;
 	case BITRATE_PEAK:
@@ -197,6 +217,18 @@ static u32 iris_get_v4l2_id(enum platform_inst_fw_cap_type cap_id)
 		return V4L2_CID_MPEG_VIDEO_GOP_SIZE;
 	case ENTROPY_MODE:
 		return V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE;
+	case DEBLOCK_MODE_H264:
+		return V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_MODE;
+	case DEBLOCK_ALPHA_H264:
+		return V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_ALPHA;
+	case DEBLOCK_BETA_H264:
+		return V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_BETA;
+	case DEBLOCK_MODE_HEVC:
+		return V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE;
+	case DEBLOCK_TC_HEVC:
+		return V4L2_CID_MPEG_VIDEO_HEVC_LF_TC_OFFSET_DIV2;
+	case DEBLOCK_BETA_HEVC:
+		return V4L2_CID_MPEG_VIDEO_HEVC_LF_BETA_OFFSET_DIV2;
 	case MIN_FRAME_QP_H264:
 		return V4L2_CID_MPEG_VIDEO_H264_MIN_QP;
 	case MIN_FRAME_QP_HEVC:
@@ -297,6 +329,10 @@ static u32 iris_get_v4l2_id(enum platform_inst_fw_cap_type cap_id)
 		return V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L4_BR;
 	case LAYER5_BITRATE_HEVC:
 		return V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L5_BR;
+	case DISPLAY_DELAY_ENABLE:
+		return V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
+	case DISPLAY_DELAY:
+		return V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY;
 	default:
 		return 0;
 	}
@@ -461,6 +497,11 @@ void iris_session_init_caps(struct iris_core *core)
 		core->inst_fw_caps_enc[cap_id].hfi_id = caps[i].hfi_id;
 		core->inst_fw_caps_enc[cap_id].set = caps[i].set;
 	}
+
+	if (core->iris_platform_data->prepend_sps_pps_to_idr &&
+	    core->inst_fw_caps_enc[PREPEND_SPSPPS_TO_IDR].cap_id ==
+		    PREPEND_SPSPPS_TO_IDR)
+		core->inst_fw_caps_enc[PREPEND_SPSPPS_TO_IDR].value = 1;
 }
 
 static u32 iris_get_port_info(struct iris_inst *inst,
@@ -641,6 +682,25 @@ int iris_set_header_mode_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_
 				     iris_get_port_info(inst, cap_id),
 				     HFI_PAYLOAD_U32_ENUM,
 				     &hfi_val, sizeof(u32));
+}
+
+int iris_set_request_sync_frame(struct iris_inst *inst,
+				enum platform_inst_fw_cap_type cap_id)
+{
+	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
+	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
+	u32 hfi_val;
+
+	if (inst->fw_caps[PREPEND_SPSPPS_TO_IDR].value)
+		hfi_val = HFI_SYNC_FRAME_REQUEST_WITH_PREFIX_SEQ_HDR;
+	else
+		hfi_val = HFI_SYNC_FRAME_REQUEST_WITHOUT_SEQ_HDR;
+
+	return hfi_ops->session_set_property(inst, hfi_id,
+					     HFI_HOST_FLAGS_NONE,
+					     iris_get_port_info(inst, cap_id),
+					     HFI_PAYLOAD_U32_ENUM,
+					     &hfi_val, sizeof(hfi_val));
 }
 
 int iris_set_bitrate_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
@@ -849,6 +909,67 @@ int iris_set_entropy_mode_gen2(struct iris_inst *inst, enum platform_inst_fw_cap
 				     iris_get_port_info(inst, cap_id),
 				     HFI_PAYLOAD_U32,
 				     &entropy_mode, sizeof(u32));
+}
+
+int iris_set_deblock_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
+{
+	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
+	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
+	u32 mode = inst->fw_caps[cap_id].value;
+	u32 alpha_tc, beta, hfi_value;
+
+	if (inst->codec == V4L2_PIX_FMT_H264) {
+		if (cap_id != DEBLOCK_MODE_H264)
+			return 0;
+
+		switch (mode) {
+		case V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_ENABLED:
+			mode = HFI_DEBLOCK_ALL_BOUNDARY;
+			break;
+		case V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED:
+			mode = HFI_DEBLOCK_DISABLE;
+			break;
+		case V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY:
+			mode = HFI_DEBLOCK_DISABLE_AT_SLICE_BOUNDARY;
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		alpha_tc = inst->fw_caps[DEBLOCK_ALPHA_H264].value + 6;
+		beta = inst->fw_caps[DEBLOCK_BETA_H264].value + 6;
+	} else if (inst->codec == V4L2_PIX_FMT_HEVC) {
+		if (cap_id != DEBLOCK_MODE_HEVC)
+			return 0;
+
+		switch (mode) {
+		case V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_ENABLED:
+			mode = HFI_DEBLOCK_ALL_BOUNDARY;
+			break;
+		case V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED:
+			mode = HFI_DEBLOCK_DISABLE;
+			break;
+		case V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY:
+			mode = HFI_DEBLOCK_DISABLE_AT_SLICE_BOUNDARY;
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		alpha_tc = inst->fw_caps[DEBLOCK_TC_HEVC].value + 6;
+		beta = inst->fw_caps[DEBLOCK_BETA_HEVC].value + 6;
+	} else {
+		return 0;
+	}
+
+	/* Firmware expects offsets biased by 6, with alpha or HEVC tc in bits 23:16. */
+	hfi_value = alpha_tc << 16 | beta << 8 | mode;
+
+	return hfi_ops->session_set_property(inst, hfi_id,
+					     HFI_HOST_FLAGS_NONE,
+					     iris_get_port_info(inst, cap_id),
+					     HFI_PAYLOAD_32_PACKED,
+					     &hfi_value, sizeof(hfi_value));
 }
 
 int iris_set_min_qp(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
@@ -1172,6 +1293,25 @@ int iris_set_ir_period_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_ty
 					     iris_get_port_info(inst, cap_id),
 					     HFI_PAYLOAD_U32,
 					     &ir_period, sizeof(u32));
+}
+
+int iris_set_time_delta_based_rc(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
+{
+	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
+	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
+	u32 value = inst->fw_caps[cap_id].value;
+
+	/*
+	 * Disable time-delta-based rate control (value = 0).
+	 * This overrides the firmware's default (enabled), ensuring the
+	 * firmware uses the configured bitrate target rather than calculating
+	 * bitrate from frame timing.
+	 */
+	return hfi_ops->session_set_property(inst, hfi_id,
+					     HFI_HOST_FLAGS_NONE,
+					     iris_get_port_info(inst, cap_id),
+					     HFI_PAYLOAD_U32,
+					     &value, sizeof(u32));
 }
 
 int iris_set_ltr_count_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)

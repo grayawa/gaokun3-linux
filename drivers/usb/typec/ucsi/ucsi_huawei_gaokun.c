@@ -8,9 +8,9 @@
 #include <drm/bridge/aux-bridge.h>
 #include <linux/auxiliary_bus.h>
 #include <linux/bitops.h>
-#include <linux/completion.h>
 #include <linux/container_of.h>
-#include <linux/delay.h>
+#include <linux/jiffies.h>
+#include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
@@ -20,12 +20,17 @@
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
-#include <linux/workqueue.h>
+#include <linux/workqueue_types.h>
 
 #include "ucsi.h"
 
 #define EC_EVENT_UCSI	0x21
 #define EC_EVENT_USB	0x22
+
+#define GAOKUN_UCSI_REGISTER_DELAY	(3 * HZ)
+#define GAOKUN_UCSI_RETRY_DELAY		(10 * HZ)
+#define GAOKUN_UCSI_MAX_RETRIES		3
+#define GAOKUN_UCSI_USB_EVENT_GRACE	(2 * HZ)
 
 #define GAOKUN_CCX_MASK		GENMASK(1, 0)
 #define GAOKUN_MUX_MASK		GENMASK(3, 2)
@@ -34,13 +39,12 @@
 #define GAOKUN_HPD_STATE_MASK	BIT(4)
 #define GAOKUN_HPD_IRQ_MASK	BIT(5)
 
-#define GET_IDX(updt) (ffs(updt) - 1)
+#define GAOKUN_UCSI_BYTES_PER_PORT	2
+#define GAOKUN_UCSI_MAX_PORTS \
+	(sizeof(((struct gaokun_ucsi_reg *)0)->port_data) / \
+	 GAOKUN_UCSI_BYTES_PER_PORT)
 
-#define GAOKUN_UCSI_CMD_TRIES		5
-#define GAOKUN_UCSI_CMD_RETRY_MS	200
-
-#define CCX_TO_ORI(ccx) (++(ccx) % 3) /* convert ccx to enum typec_orientation */
-
+#define CCX_TO_ORI(ccx) (++ccx % 3) /* convert ccx to enum typec_orientation */
 /* Configuration Channel Extension */
 enum gaokun_ucsi_ccx {
 	USBC_CCX_NORMAL,
@@ -80,19 +84,16 @@ struct gaokun_ucsi_reg {
 	u8 reserved;
 } __packed;
 
-#define GAOKUN_UCSI_BYTES_PER_PORT	2
-#define GAOKUN_UCSI_MAX_PORTS \
-	(sizeof_field(struct gaokun_ucsi_reg, port_data) / GAOKUN_UCSI_BYTES_PER_PORT)
-
 struct gaokun_ucsi_port {
+	struct delayed_work usb_work;
 	spinlock_t lock; /* serializing port resource access */
 
 	struct gaokun_ucsi *ucsi;
 	struct auxiliary_device *bridge;
-
 	struct typec_mux *typec_mux;
 	struct typec_mux_state state;
 	struct typec_altmode dp_alt;
+	struct typec_displayport_data dp_data;
 
 	int idx;
 	enum gaokun_ucsi_ccx ccx;
@@ -101,7 +102,6 @@ struct gaokun_ucsi_port {
 	u16 svid;
 	u8 hpd_state;
 	u8 hpd_irq;
-	bool hpd_reported; /* last HPD state sent to the DP bridge */
 };
 
 struct gaokun_ucsi {
@@ -110,14 +110,18 @@ struct gaokun_ucsi {
 	struct gaokun_ucsi_port *ports;
 	struct device *dev;
 	struct delayed_work work;
-	struct delayed_work usb_work; /* stands in for a missing USB event */
+	struct work_struct init_sync_work;
+	struct work_struct usb_sync_work;
 	struct notifier_block nb;
 	u16 version;
 	u8 num_ports;
-	u64 resend_cmd; /* GET_CONNECTOR_STATUS in flight, or 0 */
-	bool registered;
-	bool usb_events; /* the EC has sent a USB event */
-	bool cmd_lost; /* the EC gave up resend_cmd */
+	u8 register_retries;
+	unsigned long pending_usb_acks;
+	unsigned long last_connector_jiffies;
+	int last_connector_idx;
+	bool ports_initialized;
+	bool notifier_registered;
+	bool ucsi_registered;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -174,66 +178,6 @@ static int gaokun_ucsi_async_control(struct ucsi *ucsi, u64 command)
 	return gaokun_ec_ucsi_write(uec->ec, buf);
 }
 
-/*
- * When the connector changes again while GET_CONNECTOR_STATUS for it is
- * pending, the EC sometimes gives the command up: it reports the change
- * instead of completing the command, or sets BUSY and keeps it set. It
- * does take the next command, so send this one again; it only reads state.
- * gaokun_ucsi_notify() ends the wait when it sees either.
- *
- * This relies on what the EC was seen to do. BUSY is a legal state, so a slow
- * command looks like a dropped one at first: the CCI is read again 200 ms
- * later, and a completion that arrived meanwhile is taken as the result. The
- * command is then sent again without a CANCEL first: a dropped command was
- * never seen to complete later, the resent one completed within 50 ms, and
- * how the EC handles CANCEL was not tried. Should a dropped command complete
- * after all, its COMMAND_COMPLETE could end the wait for the next command
- * early, and that command would read the wrong MESSAGE_IN.
- */
-static int gaokun_ucsi_sync_control(struct ucsi *ucsi, u64 command, u32 *cci,
-				    void *data, size_t size, void *msg_out,
-				    size_t msg_out_size)
-{
-	struct gaokun_ucsi *uec = ucsi_get_drvdata(ucsi);
-	int tries = GAOKUN_UCSI_CMD_TRIES;
-	u32 status;
-	int ret;
-
-	if (UCSI_COMMAND(command) != UCSI_GET_CONNECTOR_STATUS)
-		return ucsi_sync_control_common(ucsi, command, cci, data, size,
-						msg_out, msg_out_size);
-
-	for (;;) {
-		if (cci)
-			*cci = 0;
-		WRITE_ONCE(uec->cmd_lost, false);
-		WRITE_ONCE(uec->resend_cmd, command);
-		ret = ucsi_sync_control_common(ucsi, command, cci, data, size,
-					       msg_out, msg_out_size);
-		WRITE_ONCE(uec->resend_cmd, 0);
-		if (!READ_ONCE(uec->cmd_lost))
-			return ret;
-
-		msleep(GAOKUN_UCSI_CMD_RETRY_MS);
-
-		/* The EC may have completed the command after all */
-		ret = gaokun_ucsi_read_cci(ucsi, &status);
-		if (ret)
-			return ret;
-		if (status & UCSI_CCI_COMMAND_COMPLETE || !--tries)
-			break;
-
-		dev_dbg(uec->dev, "resending command %#llx\n", command);
-	}
-
-	/* Without COMMAND_COMPLETE, UCSI fails the command, or cancels it */
-	if (cci)
-		*cci = status;
-	if (data && status & UCSI_CCI_COMMAND_COMPLETE)
-		ret = gaokun_ucsi_read_message_in(ucsi, data, size);
-	return ret;
-}
-
 static void gaokun_ucsi_update_connector(struct ucsi_connector *con)
 {
 	struct gaokun_ucsi *uec = ucsi_get_drvdata(con->ucsi);
@@ -244,10 +188,9 @@ static void gaokun_ucsi_update_connector(struct ucsi_connector *con)
 	con->typec_cap.orientation_aware = true;
 }
 
-static void gaokun_set_orientation(struct ucsi_connector *con,
-				   struct gaokun_ucsi_port *port)
+static int gaokun_set_orientation(struct ucsi_connector *con,
+				  struct gaokun_ucsi_port *port)
 {
-	enum typec_orientation orientation;
 	enum gaokun_ucsi_ccx ccx;
 	unsigned long flags;
 
@@ -255,9 +198,7 @@ static void gaokun_set_orientation(struct ucsi_connector *con,
 	ccx = port->ccx;
 	spin_unlock_irqrestore(&port->lock, flags);
 
-	orientation = CCX_TO_ORI(ccx);
-	if (typec_get_orientation(con->port) != orientation)
-		typec_set_orientation(con->port, orientation);
+	return typec_set_orientation(con->port, CCX_TO_ORI(ccx));
 }
 
 static void gaokun_ucsi_connector_status(struct ucsi_connector *con)
@@ -271,7 +212,9 @@ static void gaokun_ucsi_connector_status(struct ucsi_connector *con)
 		return;
 	}
 
-	gaokun_set_orientation(con, &uec->ports[idx]);
+	if (gaokun_set_orientation(con, &uec->ports[idx]))
+		dev_warn(uec->dev, "failed to set orientation for connector %d\n",
+			 idx);
 }
 
 static const struct ucsi_operations gaokun_ucsi_ops = {
@@ -279,7 +222,7 @@ static const struct ucsi_operations gaokun_ucsi_ops = {
 	.read_cci = gaokun_ucsi_read_cci,
 	.poll_cci = gaokun_ucsi_read_cci,
 	.read_message_in = gaokun_ucsi_read_message_in,
-	.sync_control = gaokun_ucsi_sync_control,
+	.sync_control = ucsi_sync_control_common,
 	.async_control = gaokun_ucsi_async_control,
 	.update_connector = gaokun_ucsi_update_connector,
 	.connector_status = gaokun_ucsi_connector_status,
@@ -310,15 +253,15 @@ static void gaokun_ucsi_port_update(struct gaokun_ucsi_port *port,
 	switch (port->mode) {
 	case USBC_DPAM_PAN_C:
 	case USBC_DPAM_PAN_C_REVERSE:
-		port->mode = TYPEC_DP_STATE_C; /* correct it for usb later */
+		port->mode = DP_PIN_ASSIGN_C; /* correct it for usb later */
 		break;
 	case USBC_DPAM_PAN_D:
 	case USBC_DPAM_PAN_D_REVERSE:
-		port->mode = TYPEC_DP_STATE_D;
+		port->mode = DP_PIN_ASSIGN_D;
 		break;
 	case USBC_DPAM_PAN_E:
 	case USBC_DPAM_PAN_E_REVERSE:
-		port->mode = TYPEC_DP_STATE_E;
+		port->mode = DP_PIN_ASSIGN_E;
 		break;
 	case USBC_DPAM_PAN_NONE:
 		port->mode = TYPEC_STATE_SAFE;
@@ -348,170 +291,474 @@ static void gaokun_ucsi_port_update(struct gaokun_ucsi_port *port,
 	spin_unlock_irqrestore(&port->lock, flags);
 }
 
-static int gaokun_ucsi_refresh(struct gaokun_ucsi *uec)
+static u8 gaokun_ucsi_valid_port_mask(const struct gaokun_ucsi *uec)
+{
+	if (!uec->num_ports)
+		return 0;
+
+	return GENMASK(uec->num_ports - 1, 0);
+}
+
+static int gaokun_ucsi_refresh(struct gaokun_ucsi *uec, u8 *port_mask)
 {
 	struct gaokun_ucsi_reg ureg;
+	u8 valid_mask, updates;
 	int ret, idx;
 
 	ret = gaokun_ec_ucsi_get_reg(uec->ec, &ureg);
 	if (ret)
-		return GAOKUN_UCSI_NO_PORT_UPDATE;
+		return ret;
 
-	idx = GET_IDX(ureg.port_updt);
+	if (ureg.num_ports != uec->num_ports)
+		dev_warn_ratelimited(uec->dev, "EC reported %u ports, expected %u\n",
+				     ureg.num_ports, uec->num_ports);
 
-	if (idx < 0 || idx >= uec->num_ports)
-		return GAOKUN_UCSI_NO_PORT_UPDATE;
+	valid_mask = gaokun_ucsi_valid_port_mask(uec);
+	if (ureg.port_updt & ~valid_mask)
+		dev_warn_ratelimited(uec->dev,
+				     "ignoring invalid EC port update mask %#x\n",
+				     ureg.port_updt);
 
-	gaokun_ucsi_port_update(&uec->ports[idx], ureg.port_data);
-	return idx;
+	updates = ureg.port_updt & valid_mask;
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		if (!(updates & BIT(idx)))
+			continue;
+
+		gaokun_ucsi_port_update(&uec->ports[idx], ureg.port_data);
+	}
+
+	*port_mask = updates;
+
+	return 0;
 }
 
-static void gaokun_ucsi_handle_usb_mode(struct gaokun_ucsi_port *port)
+static unsigned long gaokun_ucsi_typec_mux_mode(u8 mode)
+{
+	switch (mode) {
+	case DP_PIN_ASSIGN_C:
+		return TYPEC_DP_STATE_C;
+	case DP_PIN_ASSIGN_D:
+		return TYPEC_DP_STATE_D;
+	case DP_PIN_ASSIGN_E:
+		return TYPEC_DP_STATE_E;
+	default:
+		return TYPEC_STATE_SAFE;
+	}
+}
+
+static void gaokun_ucsi_handle_altmode(struct gaokun_ucsi_port *port)
 {
 	struct gaokun_ucsi *uec = port->ucsi;
 	struct ucsi_connector *con;
-	int idx = port->idx, ret;
-
-	/*
-	 * For every typec port on this platform, the only mode-switch is
-	 * controlled by its qmp combo phy which consumes svid and mode only.
-	 */
-	port->dp_alt.svid = port->svid;
-	port->state.mode = port->mode;
-	port->state.alt = &port->dp_alt;
+	unsigned long flags;
+	u16 svid;
+	u8 mode;
+	u8 hpd_state;
+	u8 hpd_irq;
+	int idx = port->idx;
+	int ret;
 
 	if (idx >= uec->num_ports) {
 		dev_warn(uec->dev, "altmode port out of range: %d\n", idx);
 		return;
 	}
 
+	spin_lock_irqsave(&port->lock, flags);
+	svid = port->svid;
+	mode = port->mode;
+	hpd_state = port->hpd_state;
+	hpd_irq = port->hpd_irq;
+	spin_unlock_irqrestore(&port->lock, flags);
+
 	/*
-	 * Set the orientation from this event before the mode and HPD, so that
-	 * the PHY lanes match the plug when DP starts link training. The
-	 * .connector_status() callback sets it too, but only once UCSI's
-	 * GET_CONNECTOR_STATUS completes, which can be later or time out. Not
-	 * under the connector lock: in the EC notifier thread, UCSI may hold it
-	 * while waiting for a command completion that only this thread can
-	 * deliver. That leaves a small race with the callback: both set the
-	 * orientation from port->ccx, so they only disagree if the callback
-	 * read it just before this event changed it and writes after this, in
-	 * which case the orientation stays stale until the next event on the
-	 * port.
+	 * The EC sideband status carries the CC orientation independently of
+	 * GET_CONNECTOR_STATUS. Keep the QMP switch in sync even when the PPM
+	 * command times out, otherwise DP link training can use the wrong lanes.
 	 */
-	if (idx < uec->ucsi->cap.num_connectors) {
+	if (uec->ucsi_registered && uec->ucsi->connector) {
 		con = &uec->ucsi->connector[idx];
-		if (con->port)
-			gaokun_set_orientation(con, port);
-	}
-
-	ret = typec_mux_set(port->typec_mux, &port->state);
-	if (ret)
-		dev_err(uec->dev, "failed to set mux %d\n", ret);
-
-	/*
-	 * Report HPD while in DP alt mode, and once more when the port leaves
-	 * it (unplug or a switch to USB), or the connector stays connected.
-	 */
-	if (port->bridge) {
-		bool hpd = port->svid == USB_TYPEC_DP_SID && port->hpd_state;
-
-		if (port->svid == USB_TYPEC_DP_SID || port->hpd_reported != hpd) {
-			drm_aux_hpd_bridge_notify(&port->bridge->dev,
-						  hpd ? connector_status_connected :
-							connector_status_disconnected);
-			port->hpd_reported = hpd;
+		if (con->port && gaokun_set_orientation(con, port)) {
+			dev_warn(uec->dev,
+				 "failed to set sideband orientation for port %d\n",
+				 idx);
+			return;
 		}
 	}
 
-	gaokun_ec_ucsi_pan_ack(uec->ec, port->idx);
+	if (port->typec_mux && svid == USB_SID_DISPLAYPORT) {
+		port->state.mode = gaokun_ucsi_typec_mux_mode(mode);
+		port->dp_alt.svid = USB_TYPEC_DP_SID;
+		port->dp_alt.mode = USB_TYPEC_DP_MODE;
+		port->state.alt = &port->dp_alt;
+
+		port->dp_data.status = DP_STATUS_ENABLED;
+		if (hpd_state)
+			port->dp_data.status |= DP_STATUS_HPD_STATE;
+		if (hpd_irq)
+			port->dp_data.status |= DP_STATUS_IRQ_HPD;
+		port->dp_data.conf = DP_CONF_SET_PIN_ASSIGN(mode);
+		port->state.data = &port->dp_data;
+
+		ret = typec_mux_set(port->typec_mux, &port->state);
+		if (ret)
+			dev_warn(uec->dev,
+				 "failed to set typec mux for port %d: mode=0x%lx ret=%d\n",
+				 idx, port->state.mode, ret);
+	}
+
+	/* UCSI callback .connector_status() have set orientation */
+	if (port->bridge)
+		drm_aux_hpd_bridge_notify(&port->bridge->dev,
+					  hpd_state ?
+					  connector_status_connected :
+					  connector_status_disconnected);
 }
 
-/* Returns whether a port had an update */
-static bool gaokun_ucsi_usb_notify_ind(struct gaokun_ucsi *uec)
+static void gaokun_ucsi_complete_usb_ack(struct gaokun_ucsi *uec, u8 port_mask)
 {
 	int idx;
 
-	if (!uec->ucsi->connector) { /* slow to register */
-		dev_err_ratelimited(uec->dev, "ucsi connector is not initialized yet\n");
-		return false;
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		if (!(port_mask & BIT(idx)))
+			continue;
+
+		clear_bit(idx, &uec->pending_usb_acks);
+	}
+}
+
+static u8 gaokun_ucsi_pending_usb_mask(struct gaokun_ucsi *uec)
+{
+	u8 port_mask = 0;
+	int idx;
+
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		if (test_bit(idx, &uec->pending_usb_acks))
+			port_mask |= BIT(idx);
 	}
 
-	idx = gaokun_ucsi_refresh(uec);
-	if (idx == GAOKUN_UCSI_NO_PORT_UPDATE) {
-		gaokun_ec_ucsi_pan_ack(uec->ec, idx); /* ack directly if no update */
-		return false;
+	return port_mask;
+}
+
+static bool gaokun_ucsi_port_disconnected(struct gaokun_ucsi_port *port)
+{
+	enum gaokun_ucsi_ccx ccx;
+	enum gaokun_ucsi_mux mux;
+	u16 svid;
+	unsigned long flags;
+
+	spin_lock_irqsave(&port->lock, flags);
+	ccx = port->ccx;
+	mux = port->mux;
+	svid = port->svid;
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	return ccx == USBC_CCX_NONE && mux == USBC_MUX_NONE && !svid;
+}
+
+static u8 gaokun_ucsi_infer_usb_complete_mask(struct gaokun_ucsi *uec)
+{
+	u8 pending_mask = gaokun_ucsi_pending_usb_mask(uec);
+	int idx = uec->last_connector_idx;
+
+	if (!pending_mask)
+		return 0;
+
+	if (hweight8(pending_mask) == 1)
+		return pending_mask;
+
+	if (idx >= 0 && idx < uec->num_ports && (pending_mask & BIT(idx)))
+		return BIT(idx);
+
+	return 0;
+}
+
+static void gaokun_ucsi_reschedule_usb_followups(struct gaokun_ucsi *uec,
+						 u8 port_mask)
+{
+	struct gaokun_ucsi_port *port;
+	int idx;
+
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		if (!(port_mask & BIT(idx)))
+			continue;
+
+		port = &uec->ports[idx];
+		mod_delayed_work(system_wq, &port->usb_work, 2 * HZ);
+	}
+}
+
+static void gaokun_ucsi_ack_updates(struct gaokun_ucsi *uec, u8 port_mask)
+{
+	int first_ret = 0;
+	int idx;
+
+	if (!port_mask) {
+		first_ret = gaokun_ec_ucsi_pan_ack(uec->ec,
+						   GAOKUN_UCSI_NO_PORT_UPDATE);
+		goto out;
 	}
 
-	gaokun_ucsi_handle_usb_mode(&uec->ports[idx]);
-	return true;
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		int ret;
+
+		if (!(port_mask & BIT(idx)))
+			continue;
+
+		ret = gaokun_ec_ucsi_pan_ack(uec->ec, idx);
+		if (ret && !first_ret)
+			first_ret = ret;
+	}
+
+out:
+	if (first_ret)
+		dev_warn_ratelimited(uec->dev,
+				     "failed to ack EC port updates %#x: %d\n",
+				     port_mask, first_ret);
+}
+
+static int gaokun_ucsi_refresh_ppm_locked(struct gaokun_ucsi *uec, u8 *port_mask)
+{
+	int ret;
+
+	/*
+	 * These EC register accesses are outside the normal UCSI core command
+	 * flow. Serialize them with the core's PPM lock so delayed altmode
+	 * recovery cannot collide with GET_CONNECTOR_STATUS and leave the
+	 * connector state stale after repeated plug/unplug cycles.
+	 */
+	mutex_lock(&uec->ucsi->ppm_lock);
+	ret = gaokun_ucsi_refresh(uec, port_mask);
+	mutex_unlock(&uec->ucsi->ppm_lock);
+
+	return ret;
+}
+
+static void gaokun_ucsi_refresh_snapshot_trylock(struct gaokun_ucsi *uec)
+{
+	u8 port_mask;
+	int ret;
+
+	if (!uec->ucsi_registered)
+		return;
+
+	/*
+	 * connector_status() consumes port->ccx from our private EC snapshot,
+	 * not from the generic UCSI connector status. On this platform the USB
+	 * follow-up refresh may be deferred behind ppm_lock, which can leave
+	 * connector change work using stale orientation data. Refresh the
+	 * snapshot opportunistically here, but never block the notifier path.
+	 *
+	 * We intentionally do not ACK anything here. This is only a best-effort
+	 * snapshot update so connector_status() sees fresher orientation state.
+	 */
+	if (!mutex_trylock(&uec->ucsi->ppm_lock))
+		return;
+
+	ret = gaokun_ucsi_refresh(uec, &port_mask);
+	mutex_unlock(&uec->ucsi->ppm_lock);
+
+}
+
+static void gaokun_ucsi_ack_updates_ppm_locked(struct gaokun_ucsi *uec, u8 port_mask)
+{
+	mutex_lock(&uec->ucsi->ppm_lock);
+	gaokun_ucsi_ack_updates(uec, port_mask);
+	mutex_unlock(&uec->ucsi->ppm_lock);
+}
+
+static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
+					   bool got_usb_event,
+					   bool defer_on_ppm_busy)
+{
+	u8 port_mask;
+	u8 complete_mask = 0;
+	int idx;
+	int ret;
+
+	if (!uec->ucsi_registered) {
+		/*
+		 * On MateBook E Go, early EC/UCSI activity indirectly shares
+		 * the same boot-time path as internal display bring-up. Touching
+		 * UCSI state too early can leave the panel dark, so ack and drop
+		 * pending events until UCSI core registration has completed.
+		 */
+		dev_warn_ratelimited(uec->dev,
+				     "ucsi connector is not initialized yet, acking pending event\n");
+		gaokun_ucsi_ack_updates_ppm_locked(uec, 0);
+		return;
+	}
+
+	if (got_usb_event && defer_on_ppm_busy) {
+		if (!mutex_trylock(&uec->ucsi->ppm_lock)) {
+			port_mask = gaokun_ucsi_pending_usb_mask(uec);
+			/*
+			 * A real EC_EVENT_USB already arrived. If the UCSI core
+			 * is still holding ppm_lock for connector-change
+			 * handling, do not block the notifier thread here.
+			 * Extend the existing follow-up timers and let a worker
+			 * perform the same sideband sync once the core finishes.
+			 */
+			gaokun_ucsi_reschedule_usb_followups(uec, port_mask);
+			queue_work(system_wq, &uec->usb_sync_work);
+			return;
+		}
+
+		ret = gaokun_ucsi_refresh(uec, &port_mask);
+		mutex_unlock(&uec->ucsi->ppm_lock);
+	} else {
+		ret = gaokun_ucsi_refresh_ppm_locked(uec, &port_mask);
+	}
+
+	if (ret)
+		return;
+
+	if (got_usb_event) {
+		complete_mask = port_mask;
+		if (!complete_mask)
+			complete_mask = gaokun_ucsi_infer_usb_complete_mask(uec);
+		gaokun_ucsi_complete_usb_ack(uec, complete_mask);
+	}
+
+	if (!port_mask) {
+		gaokun_ucsi_ack_updates_ppm_locked(uec, 0);
+		return;
+	}
+
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		if (!(port_mask & BIT(idx)))
+			continue;
+
+		gaokun_ucsi_handle_altmode(&uec->ports[idx]);
+	}
+
+	gaokun_ucsi_ack_updates_ppm_locked(uec, port_mask);
+}
+
+static void gaokun_ucsi_sync_deferred_usb(struct work_struct *work)
+{
+	struct gaokun_ucsi *uec = container_of(work, struct gaokun_ucsi,
+					       usb_sync_work);
+
+	gaokun_ucsi_altmode_notify_ind(uec, true, false);
+}
+
+static void gaokun_ucsi_sync_initial_state(struct work_struct *work)
+{
+	struct gaokun_ucsi *uec = container_of(work, struct gaokun_ucsi,
+					       init_sync_work);
+	u8 port_mask;
+	int idx;
+	int ret;
+
+	if (!uec->ucsi_registered)
+		return;
+
+	/*
+	 * The EC can accumulate sideband port-update state before the delayed
+	 * UCSI notifier registration completes. Resync once after registration
+	 * so the first real hotplug does not inherit stale boot-time updates.
+	 */
+	ret = gaokun_ucsi_refresh_ppm_locked(uec, &port_mask);
+	if (ret || !port_mask)
+		return;
+
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		if (!(port_mask & BIT(idx)))
+			continue;
+
+		gaokun_ucsi_handle_altmode(&uec->ports[idx]);
+	}
+
+	gaokun_ucsi_ack_updates_ppm_locked(uec, port_mask);
+}
+
+static bool gaokun_ucsi_should_handle_usb_event(struct gaokun_ucsi *uec)
+{
+	struct gaokun_ucsi_port *port;
+	unsigned long flags;
+	int idx;
+
+	if (gaokun_ucsi_pending_usb_mask(uec))
+		return true;
+
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		port = &uec->ports[idx];
+
+		spin_lock_irqsave(&port->lock, flags);
+		if (port->svid == USB_SID_DISPLAYPORT) {
+			spin_unlock_irqrestore(&port->lock, flags);
+			return true;
+		}
+		spin_unlock_irqrestore(&port->lock, flags);
+	}
+
+	if (uec->last_connector_idx == GAOKUN_UCSI_NO_PORT_UPDATE)
+		return false;
+
+	return !time_is_before_jiffies(uec->last_connector_jiffies +
+					 GAOKUN_UCSI_USB_EVENT_GRACE);
 }
 
 /*
  * USB event is necessary for enabling altmode, the event should follow
  * UCSI event, if not after timeout(this notify may be disabled somehow),
- * then force to enable altmode. When inserting, 2 UCSI events (connector
- * change) are followed by USB events. Once we have received one USB event,
- * USB events are not blocked, and the fallback is no longer needed.
+ * then force to enable altmode.
  */
-static void gaokun_ucsi_usb_work(struct work_struct *work)
+static void gaokun_ucsi_handle_no_usb_event(struct work_struct *work)
 {
-	struct gaokun_ucsi *uec = container_of(work, struct gaokun_ucsi,
-					       usb_work.work);
-	int i;
+	struct gaokun_ucsi_port *port;
+	struct gaokun_ucsi *uec;
 
-	dev_warn(uec->dev, "No USB EVENT, triggered by UCSI EVENT\n");
-
-	/* One update per call; this stands in for several UCSI events */
-	for (i = 0; i < uec->num_ports; i++)
-		if (!gaokun_ucsi_usb_notify_ind(uec))
-			break;
-}
-
-/* See gaokun_ucsi_sync_control() */
-static void gaokun_ucsi_check_lost_cmd(struct gaokun_ucsi *uec, u32 cci)
-{
-	u64 cmd = READ_ONCE(uec->resend_cmd);
-
-	if (!cmd || !test_bit(COMMAND_PENDING, &uec->ucsi->flags) ||
-	    cci & UCSI_CCI_COMMAND_COMPLETE)
+	port = container_of(to_delayed_work(work), struct gaokun_ucsi_port,
+			    usb_work);
+	uec = port->ucsi;
+	if (!test_and_clear_bit(port->idx, &uec->pending_usb_acks))
 		return;
 
-	if (cci & UCSI_CCI_BUSY ||
-	    UCSI_CCI_CONNECTOR(cci) == UCSI_DEFAULT_GET_CONNECTOR_NUMBER(cmd)) {
-		WRITE_ONCE(uec->cmd_lost, true);
-		complete(&uec->ucsi->complete);
-	}
+	if (gaokun_ucsi_port_disconnected(port))
+		return;
+
+	dev_warn(uec->dev, "missing USB event for port %d after UCSI event\n",
+		 port->idx);
+	gaokun_ucsi_altmode_notify_ind(uec, false, false);
 }
 
 static int gaokun_ucsi_notify(struct notifier_block *nb,
 			      unsigned long action, void *data)
 {
 	u32 cci;
-	int ret;
 	struct gaokun_ucsi *uec = container_of(nb, struct gaokun_ucsi, nb);
 
 	switch (action) {
 	case EC_EVENT_USB:
-		uec->usb_events = true;
-		cancel_delayed_work_sync(&uec->usb_work);
-		gaokun_ucsi_usb_notify_ind(uec);
+		if (!gaokun_ucsi_should_handle_usb_event(uec)) {
+			return NOTIFY_OK;
+		}
+		gaokun_ucsi_altmode_notify_ind(uec, true, true);
 		return NOTIFY_OK;
 
 	case EC_EVENT_UCSI:
-		ret = gaokun_ucsi_read_cci(uec->ucsi, &cci);
-		if (ret)
-			return NOTIFY_DONE;
-
-		gaokun_ucsi_check_lost_cmd(uec, cci);
+		if (gaokun_ucsi_read_cci(uec->ucsi, &cci))
+			return NOTIFY_BAD;
+		if (UCSI_CCI_CONNECTOR(cci))
+			gaokun_ucsi_refresh_snapshot_trylock(uec);
 		ucsi_notify_common(uec->ucsi, cci);
-		/*
-		 * The USB event is delivered by the same EC IRQ thread that runs
-		 * this notifier, so it cannot be waited for here. Freezable, so
-		 * the fallback does not run during system suspend.
-		 */
-		if (UCSI_CCI_CONNECTOR(cci) && !uec->usb_events)
-			queue_delayed_work(system_freezable_wq, &uec->usb_work,
-					   2 * HZ);
+		if (UCSI_CCI_CONNECTOR(cci)) {
+			struct gaokun_ucsi_port *port;
+			u8 idx = UCSI_CCI_CONNECTOR(cci) - 1;
+
+			if (idx >= uec->num_ports) {
+				dev_warn(uec->dev, "connector out of range: %lu\n",
+					 UCSI_CCI_CONNECTOR(cci));
+				return NOTIFY_BAD;
+			}
+
+			port = &uec->ports[idx];
+			uec->last_connector_idx = idx;
+			uec->last_connector_jiffies = jiffies;
+			set_bit(idx, &uec->pending_usb_acks);
+			mod_delayed_work(system_wq, &port->usb_work, 2 * HZ);
+		}
 
 		return NOTIFY_OK;
 
@@ -523,30 +770,39 @@ static int gaokun_ucsi_notify(struct notifier_block *nb,
 static int gaokun_ucsi_ports_init(struct gaokun_ucsi *uec)
 {
 	struct gaokun_ucsi_port *ucsi_port;
-	struct gaokun_ucsi_reg ureg = {};
 	struct device *dev = uec->dev;
 	struct fwnode_handle *fwnode;
 	int i, ret, num_ports;
 	u32 port;
 
-	gaokun_ec_ucsi_get_reg(uec->ec, &ureg);
-	num_ports = ureg.num_ports;
-	if (num_ports > GAOKUN_UCSI_MAX_PORTS) {
-		dev_warn(dev, "EC reports %d ports, the register holds data for %zu\n",
-			 num_ports, GAOKUN_UCSI_MAX_PORTS);
-		num_ports = GAOKUN_UCSI_MAX_PORTS;
-	}
-	uec->ports = devm_kcalloc(dev, num_ports, sizeof(*uec->ports),
+	if (uec->ports_initialized)
+		return 0;
+
+	num_ports = 0;
+	device_for_each_child_node(dev, fwnode)
+		num_ports++;
+
+	if (num_ports <= 0)
+		return dev_err_probe(dev, -ENODEV,
+				     "no connector child nodes found for UCSI bridge setup\n");
+	if (num_ports > GAOKUN_UCSI_MAX_PORTS)
+		return dev_err_probe(dev, -EINVAL,
+				     "DT reported %d UCSI ports, max %zu\n",
+				     num_ports, (size_t)GAOKUN_UCSI_MAX_PORTS);
+
+	uec->num_ports = num_ports;
+	uec->ports = devm_kcalloc(dev, num_ports, sizeof(*(uec->ports)),
 				  GFP_KERNEL);
 	if (!uec->ports)
 		return -ENOMEM;
-	uec->num_ports = num_ports;
 
 	for (i = 0; i < num_ports; ++i) {
 		ucsi_port = &uec->ports[i];
 		ucsi_port->ccx = USBC_CCX_NONE;
 		ucsi_port->idx = i;
 		ucsi_port->ucsi = uec;
+		INIT_DELAYED_WORK(&ucsi_port->usb_work,
+				  gaokun_ucsi_handle_no_usb_event);
 		spin_lock_init(&ucsi_port->lock);
 	}
 
@@ -572,10 +828,13 @@ static int gaokun_ucsi_ports_init(struct gaokun_ucsi *uec)
 
 		ucsi_port->typec_mux = fwnode_typec_mux_get(fwnode);
 		if (IS_ERR(ucsi_port->typec_mux)) {
-			fwnode_handle_put(fwnode);
-			return dev_err_probe(dev, PTR_ERR(ucsi_port->typec_mux),
-					     "failed to acquire mode-switch for port: %d\n",
-					     port);
+			ret = PTR_ERR(ucsi_port->typec_mux);
+			if (ret == -ENODEV) {
+				ucsi_port->typec_mux = NULL;
+			} else {
+				fwnode_handle_put(fwnode);
+				return ret;
+			}
 		}
 	}
 	for (i = 0; i < num_ports; i++) {
@@ -586,6 +845,28 @@ static int gaokun_ucsi_ports_init(struct gaokun_ucsi *uec)
 		if (ret)
 			return ret;
 	}
+
+	uec->ports_initialized = true;
+
+	return 0;
+}
+
+static int gaokun_ucsi_ec_init(struct gaokun_ucsi *uec)
+{
+	struct gaokun_ucsi_reg ureg = {};
+	int ret;
+
+	ret = gaokun_ec_ucsi_get_reg(uec->ec, &ureg);
+	if (ret)
+		return ret;
+
+	if (ureg.num_ports <= 0)
+		return -ENODEV;
+
+	if (ureg.num_ports > uec->num_ports)
+		return -EINVAL;
+
+	uec->num_ports = ureg.num_ports;
 
 	return 0;
 }
@@ -599,20 +880,44 @@ static void gaokun_ucsi_register_worker(struct work_struct *work)
 	uec = container_of(work, struct gaokun_ucsi, work.work);
 	ucsi = uec->ucsi;
 
-	ret = gaokun_ec_register_notify(uec->ec, &uec->nb);
-	if (ret) {
-		dev_err_probe(ucsi->dev, ret, "notifier register failed\n");
-		return;
-	}
+	ret = gaokun_ucsi_ports_init(uec);
+	if (ret)
+		goto retry;
+
+	ret = gaokun_ucsi_ec_init(uec);
+	if (ret)
+		goto retry;
 
 	ret = ucsi_register(ucsi);
 	if (ret) {
 		dev_err_probe(ucsi->dev, ret, "ucsi register failed\n");
-		gaokun_ec_unregister_notify(uec->ec, &uec->nb);
+		goto retry;
+	}
+	uec->ucsi_registered = true;
+
+	ret = gaokun_ec_register_notify(uec->ec, &uec->nb);
+	if (ret) {
+		dev_err_probe(ucsi->dev, ret, "notifier register failed\n");
+		ucsi_unregister(ucsi);
+		uec->ucsi_registered = false;
+		goto retry;
+	}
+	uec->notifier_registered = true;
+	schedule_work(&uec->init_sync_work);
+
+	return;
+
+retry:
+	if (++uec->register_retries > GAOKUN_UCSI_MAX_RETRIES) {
+		dev_err(uec->dev, "giving up on UCSI registration after %u attempts\n",
+			uec->register_retries);
 		return;
 	}
 
-	uec->registered = true;
+	dev_warn(uec->dev, "retrying UCSI registration in %u seconds (attempt %u/%u)\n",
+		 GAOKUN_UCSI_RETRY_DELAY / HZ,
+		 uec->register_retries, GAOKUN_UCSI_MAX_RETRIES);
+	schedule_delayed_work(&uec->work, GAOKUN_UCSI_RETRY_DELAY);
 }
 
 static int gaokun_ucsi_probe(struct auxiliary_device *adev,
@@ -630,24 +935,31 @@ static int gaokun_ucsi_probe(struct auxiliary_device *adev,
 	uec->ec = ec;
 	uec->dev = dev;
 	uec->version = UCSI_VERSION_1_0;
+	uec->last_connector_idx = GAOKUN_UCSI_NO_PORT_UPDATE;
 	uec->nb.notifier_call = gaokun_ucsi_notify;
 
 	INIT_DELAYED_WORK(&uec->work, gaokun_ucsi_register_worker);
-	INIT_DELAYED_WORK(&uec->usb_work, gaokun_ucsi_usb_work);
+	INIT_WORK(&uec->init_sync_work, gaokun_ucsi_sync_initial_state);
+	INIT_WORK(&uec->usb_sync_work, gaokun_ucsi_sync_deferred_usb);
 
 	ret = gaokun_ucsi_ports_init(uec);
 	if (ret)
-		return ret;
+		return dev_err_probe(dev, ret, "failed to initialize UCSI ports\n");
 
 	uec->ucsi = ucsi_create(dev, &gaokun_ucsi_ops);
 	if (IS_ERR(uec->ucsi))
-		return PTR_ERR(uec->ucsi);
+		return dev_err_probe(dev, PTR_ERR(uec->ucsi),
+				     "failed to create UCSI instance\n");
 
 	ucsi_set_drvdata(uec->ucsi, uec);
 	auxiliary_set_drvdata(adev, uec);
 
-	/* EC can't handle UCSI properly in the early stage */
-	schedule_delayed_work(&uec->work, 3 * HZ);
+	/*
+	 * On MateBook E Go, early EC/UCSI traffic indirectly participates in
+	 * the internal display bring-up chain. Defer registration until the
+	 * platform settles to avoid booting with a dark panel.
+	 */
+	schedule_delayed_work(&uec->work, GAOKUN_UCSI_REGISTER_DELAY);
 
 	return 0;
 }
@@ -658,15 +970,18 @@ static void gaokun_ucsi_remove(struct auxiliary_device *adev)
 	int i;
 
 	disable_delayed_work_sync(&uec->work);
-	if (uec->registered)
+	cancel_work_sync(&uec->init_sync_work);
+	if (uec->notifier_registered)
 		gaokun_ec_unregister_notify(uec->ec, &uec->nb);
-	disable_delayed_work_sync(&uec->usb_work);
-	if (uec->registered)
+	cancel_work_sync(&uec->usb_sync_work);
+	if (uec->ports_initialized) {
+		for (i = 0; i < uec->num_ports; i++) {
+			cancel_delayed_work_sync(&uec->ports[i].usb_work);
+			typec_mux_put(uec->ports[i].typec_mux);
+		}
+	}
+	if (uec->ucsi_registered)
 		ucsi_unregister(uec->ucsi);
-
-	for (i = 0; i < uec->num_ports; ++i)
-		typec_mux_put(uec->ports[i].typec_mux);
-
 	ucsi_destroy(uec->ucsi);
 }
 

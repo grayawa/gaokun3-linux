@@ -198,16 +198,8 @@ static int iris_hfi_gen1_session_stop(struct iris_inst *inst, u32 plane)
 			if (V4L2_TYPE_IS_OUTPUT(plane))
 				flush_type = HFI_FLUSH_ALL;
 			else if (V4L2_TYPE_IS_CAPTURE(plane))
-				/*
-				 * Only a resolution change keeps the bitstream queued, so only
-				 * then flush the picture side alone. Any other CAPTURE streamoff
-				 * while streaming (stop, seek) drops the OUTPUT queue right after:
-				 * flush everything, as venus vdec_stop_capture() does. On sc8280xp
-				 * the firmware mostly never completes an HFI_FLUSH_OUTPUT sent
-				 * here, and then stops reading the command queue altogether.
-				 */
 				flush_type = inst->sub_state & (IRIS_INST_SUB_DRC |
-								IRIS_INST_SUB_DRC_LAST) ?
+							       IRIS_INST_SUB_DRC_LAST) ?
 					     HFI_FLUSH_OUTPUT : HFI_FLUSH_ALL;
 
 			reinit_completion(&inst->flush_completion);
@@ -222,7 +214,26 @@ static int iris_hfi_gen1_session_stop(struct iris_inst *inst, u32 plane)
 				inst->flush_responses_pending++;
 				ret = iris_wait_for_session_response(inst, true);
 			}
+		} else if (!inst->closing && READ_ONCE(iris_seek_mode) == 1 &&
+			   V4L2_TYPE_IS_OUTPUT(plane) &&
+			   inst->state == IRIS_INST_INPUT_STREAMING &&
+			   inst->sub_state & IRIS_INST_SUB_LOAD_RESOURCES) {
+			reinit_completion(&inst->flush_completion);
+
+			flush_pkt.shdr.hdr.size = sizeof(struct hfi_session_flush_pkt);
+			flush_pkt.shdr.hdr.pkt_type = HFI_CMD_SESSION_FLUSH;
+			flush_pkt.shdr.session_id = inst->session_id;
+			flush_pkt.flush_type = HFI_FLUSH_ALL;
+
+			ret = iris_hfi_queue_cmd_write(core, &flush_pkt, flush_pkt.shdr.hdr.size);
+			if (!ret) {
+				inst->flush_responses_pending++;
+				ret = iris_wait_for_session_response(inst, true);
+			}
+			if (!ret)
+				inst->seek_resume = true;
 		} else if (inst->sub_state & IRIS_INST_SUB_LOAD_RESOURCES) {
+			inst->seek_resume = false;
 			reinit_completion(&inst->completion);
 			iris_hfi_gen1_packet_session_cmd(inst, &pkt, HFI_CMD_SESSION_STOP);
 			ret = iris_hfi_queue_cmd_write(core, &pkt, pkt.shdr.hdr.size);
@@ -565,6 +576,17 @@ iris_hfi_gen1_packet_session_set_property(struct hfi_session_set_property_pkt *p
 		packet->shdr.hdr.size += sizeof(*multi);
 		break;
 	}
+	case HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER: {
+		u32 *output_order = pdata;
+
+		if (*output_order != HFI_OUTPUT_ORDER_DISPLAY &&
+		    *output_order != HFI_OUTPUT_ORDER_DECODE)
+			return -EINVAL;
+
+		packet->data[1] = *output_order;
+		packet->shdr.hdr.size += sizeof(u32) * 2;
+		break;
+	}
 	case HFI_PROPERTY_PARAM_BUFFER_SIZE_ACTUAL: {
 		struct hfi_buffer_size_actual *in = pdata, *sz = prop_data;
 
@@ -613,6 +635,8 @@ iris_hfi_gen1_packet_session_set_property(struct hfi_session_set_property_pkt *p
 		packet->shdr.hdr.size += sizeof(*en);
 		break;
 	}
+	case HFI_PROPERTY_CONFIG_VENC_REQUEST_SYNC_FRAME:
+		break;
 	case HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE: {
 		struct hfi_bitrate *in = pdata, *brate = prop_data;
 
@@ -801,8 +825,13 @@ static int iris_hfi_gen1_set_resolution(struct iris_inst *inst, u32 plane)
 
 	if (!iris_drc_pending(inst) && !(inst->sub_state & IRIS_INST_SUB_FIRST_IPSC)) {
 		fs.buffer_type = HFI_BUFFER_INPUT;
-		fs.width = inst->fmt_src->fmt.pix_mp.width;
-		fs.height = inst->fmt_src->fmt.pix_mp.height;
+		if (inst->domain == ENCODER) {
+			fs.width = inst->enc_raw_width;
+			fs.height = inst->enc_raw_height;
+		} else {
+			fs.width = inst->fmt_src->fmt.pix_mp.width;
+			fs.height = inst->fmt_src->fmt.pix_mp.height;
+		}
 
 		ret = hfi_gen1_set_property(inst, ptype, &fs, sizeof(fs));
 		if (ret)
@@ -813,8 +842,13 @@ static int iris_hfi_gen1_set_resolution(struct iris_inst *inst, u32 plane)
 	else
 		fs.buffer_type = HFI_BUFFER_OUTPUT;
 
-	fs.width = inst->fmt_dst->fmt.pix_mp.width;
-	fs.height = inst->fmt_dst->fmt.pix_mp.height;
+	if (inst->domain == ENCODER) {
+		fs.width = inst->enc_scale_width;
+		fs.height = inst->enc_scale_height;
+	} else {
+		fs.width = inst->fmt_dst->fmt.pix_mp.width;
+		fs.height = inst->fmt_dst->fmt.pix_mp.height;
+	}
 
 	return hfi_gen1_set_property(inst, ptype, &fs, sizeof(fs));
 }
@@ -840,15 +874,28 @@ static int iris_hfi_gen1_set_raw_format(struct iris_inst *inst, u32 plane)
 		pixelformat = inst->fmt_dst->fmt.pix_mp.pixelformat;
 		if (iris_split_mode_enabled(inst)) {
 			fmt.buffer_type = HFI_BUFFER_OUTPUT;
-			fmt.format = HFI_COLOR_FORMAT_NV12_UBWC;
+			fmt.format = iris_fmt_is_10bit(pixelformat) ?
+				HFI_COLOR_FORMAT_YUV420_TP10_UBWC : HFI_COLOR_FORMAT_NV12_UBWC;
 
 			ret = hfi_gen1_set_property(inst, ptype, &fmt, sizeof(fmt));
 			if (ret)
 				return ret;
 
 			fmt.buffer_type = HFI_BUFFER_OUTPUT2;
-			fmt.format = pixelformat == V4L2_PIX_FMT_NV12 ?
-				HFI_COLOR_FORMAT_NV12 : HFI_COLOR_FORMAT_NV12_UBWC;
+			switch (pixelformat) {
+			case V4L2_PIX_FMT_NV12:
+				fmt.format = HFI_COLOR_FORMAT_NV12;
+				break;
+			case V4L2_PIX_FMT_P010:
+				fmt.format = HFI_COLOR_FORMAT_P010;
+				break;
+			case V4L2_PIX_FMT_QC10C:
+				fmt.format = HFI_COLOR_FORMAT_YUV420_TP10_UBWC;
+				break;
+			default:
+				fmt.format = HFI_COLOR_FORMAT_NV12_UBWC;
+				break;
+			}
 
 			ret = hfi_gen1_set_property(inst, ptype, &fmt, sizeof(fmt));
 		} else {
@@ -873,18 +920,20 @@ static int iris_hfi_gen1_set_format_constraints(struct iris_inst *inst, u32 plan
 {
 	const u32 ptype = HFI_PROPERTY_PARAM_UNCOMPRESSED_PLANE_ACTUAL_CONSTRAINTS_INFO;
 	struct hfi_uncompressed_plane_actual_constraints_info pconstraint;
+	u32 pixelformat = inst->fmt_dst->fmt.pix_mp.pixelformat;
+	u32 stride_multiples = pixelformat == V4L2_PIX_FMT_P010 ? 256 : 128;
 
-	if (inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_QC08C)
+	if (pixelformat == V4L2_PIX_FMT_QC08C || pixelformat == V4L2_PIX_FMT_QC10C)
 		return 0;
 
 	pconstraint.buffer_type = HFI_BUFFER_OUTPUT2;
 	pconstraint.num_planes = 2;
-	pconstraint.plane_format[0].stride_multiples = 128;
+	pconstraint.plane_format[0].stride_multiples = stride_multiples;
 	pconstraint.plane_format[0].max_stride = 8192;
 	pconstraint.plane_format[0].min_plane_buffer_height_multiple = 32;
 	pconstraint.plane_format[0].buffer_alignment = 256;
 
-	pconstraint.plane_format[1].stride_multiples = 128;
+	pconstraint.plane_format[1].stride_multiples = stride_multiples;
 	pconstraint.plane_format[1].max_stride = 8192;
 	pconstraint.plane_format[1].min_plane_buffer_height_multiple = 16;
 	pconstraint.plane_format[1].buffer_alignment = 256;
@@ -1042,6 +1091,21 @@ static int iris_hfi_gen1_set_stride(struct iris_inst *inst, u32 plane)
 	return hfi_gen1_set_property(inst, ptype, &plane_actual_info, sizeof(plane_actual_info));
 }
 
+static int iris_hfi_gen1_set_decode_order_output(struct iris_inst *inst, u32 plane)
+{
+	struct platform_inst_fw_cap *cap = &inst->fw_caps[DISPLAY_DELAY_ENABLE];
+	u32 output_order;
+
+	if (!(cap->flags & CAP_FLAG_CLIENT_SET))
+		return 0;
+
+	output_order = cap->value ? HFI_OUTPUT_ORDER_DECODE :
+				    HFI_OUTPUT_ORDER_DISPLAY;
+
+	return hfi_gen1_set_property(inst, HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER,
+				     &output_order, sizeof(output_order));
+}
+
 static int iris_hfi_gen1_session_set_config_params(struct iris_inst *inst, u32 plane)
 {
 	struct iris_hfi_prop_type_handle const *handler = NULL;
@@ -1052,6 +1116,8 @@ static int iris_hfi_gen1_session_set_config_params(struct iris_inst *inst, u32 p
 	int ret;
 
 	static const struct iris_hfi_prop_type_handle vdec_prop_type_handle_inp_arr[] = {
+		{HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER,
+			iris_hfi_gen1_set_decode_order_output},
 		{HFI_PROPERTY_PARAM_FRAME_SIZE,
 			iris_hfi_gen1_set_resolution},
 		{HFI_PROPERTY_CONFIG_VIDEOCORES_USAGE,

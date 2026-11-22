@@ -104,6 +104,20 @@ enum icc_count {
 	ICC_SM8250_COUNT = 4,
 };
 
+/*
+ * The rail level (RPMh corner) a clock needs: up to @rate, @level. Clocks a
+ * platform lists here are voted for on its power domain while enabled.
+ * '#' in @clock matches one digit.
+ */
+struct camss_clock_level {
+	const char *clock;
+	u32 rate;
+	u32 level;
+};
+
+/* Subdevices with clocks enabled at once, each with its own rail vote */
+#define CAMSS_LEVEL_VOTES	32
+
 struct camss_resources {
 	enum camss_version version;
 	const char *pd_name;
@@ -119,11 +133,18 @@ struct camss_resources {
 	const unsigned int tpg_num;
 	const unsigned int csid_num;
 	const unsigned int vfe_num;
+	const struct camss_clock_level *clock_levels;
+	const unsigned int clock_levels_num;
 };
 
 struct camss {
 	struct v4l2_device v4l2_dev;
 	struct v4l2_async_notifier notifier;
+	/* Fallback state for completing the notifier without unbound sensors */
+	struct delayed_work sensor_fallback_work;
+	bool notifier_complete;
+	struct fwnode_handle *bound_sensors[8];
+	unsigned int num_bound_sensors;
 	struct media_device media_dev;
 	struct device *dev;
 	struct csiphy_device *csiphy;
@@ -134,6 +155,13 @@ struct camss {
 	void __iomem *csid_wrapper_base;
 	atomic_t ref_count;
 	int genpd_num;
+	/* Subdevices with clocks enabled, whose rates set the rail level */
+	struct mutex level_lock;
+	struct {
+		const struct camss_clock *clocks;
+		int nclocks;
+	} level_votes[CAMSS_LEVEL_VOTES];
+	u32 level;
 	struct device *genpd;
 	struct device_link *genpd_link;
 	struct icc_path *icc_path[ICC_SM8250_COUNT];
@@ -166,7 +194,8 @@ struct parent_dev_ops {
 void camss_add_clock_margin(u64 *rate);
 int camss_enable_clocks(int nclocks, struct camss_clock *clock,
 			struct device *dev);
-void camss_disable_clocks(int nclocks, struct camss_clock *clock);
+void camss_disable_clocks(int nclocks, struct camss_clock *clock,
+			  struct device *dev);
 struct media_pad *camss_find_sensor_pad(struct media_entity *entity);
 s64 camss_get_link_freq(struct media_entity *entity, unsigned int bpp,
 			unsigned int lanes);

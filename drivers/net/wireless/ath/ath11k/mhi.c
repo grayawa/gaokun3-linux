@@ -446,6 +446,7 @@ int ath11k_mhi_start(struct ath11k_pci *ab_pci)
 		ath11k_warn(ab, "failed to prepare mhi: %d", ret);
 		return ret;
 	}
+	set_bit(ATH11K_PCI_MHI_PREPARED, &ab_pci->flags);
 
 	ret = mhi_sync_power_up(ab_pci->mhi_ctrl);
 	if (ret) {
@@ -458,6 +459,9 @@ int ath11k_mhi_start(struct ath11k_pci *ab_pci)
 
 void ath11k_mhi_stop(struct ath11k_pci *ab_pci, bool is_suspend)
 {
+	if (!test_and_clear_bit(ATH11K_PCI_MHI_PREPARED, &ab_pci->flags))
+		return;
+
 	/* During suspend we need to use mhi_power_down_keep_dev()
 	 * workaround, otherwise ath11k_core_resume() will timeout
 	 * during resume.
@@ -489,12 +493,6 @@ int ath11k_mhi_resume(struct ath11k_pci *ab_pci)
 	struct ath11k_base *ab = ab_pci->ab;
 	int ret;
 
-	/*
-	 * If the firmware crashed while the system was asleep, the device
-	 * is in RDDM and won't return to M0: a forced resume would only wait
-	 * for the timeout. Hand it to crash recovery, which restarts it once
-	 * the system is up.
-	 */
 	if (mhi_get_exec_env(ab_pci->mhi_ctrl) == MHI_EE_RDDM ||
 	    mhi_get_mhi_state(ab_pci->mhi_ctrl) == MHI_STATE_SYS_ERR) {
 		ath11k_warn(ab, "firmware crashed during suspend\n");

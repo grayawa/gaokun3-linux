@@ -31,6 +31,7 @@
 #include "dpu_crtc.h"
 #include "dpu_encoder.h"
 #include "dpu_formats.h"
+#include "dpu_hw_dspp.h"
 #include "dpu_hw_vbif.h"
 #include "dpu_kms.h"
 #include "dpu_plane.h"
@@ -1267,6 +1268,15 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	/* Disable vblank irqs aggressively for power-saving */
 	dev->vblank_disable_immediate = true;
 
+	dpu_kms->panel_lut = devm_kcalloc(&dpu_kms->pdev->dev,
+					  DPU_PANEL_CAL_GAMUTS,
+					  sizeof(*dpu_kms->panel_lut), GFP_KERNEL);
+	rc = dpu_kms->panel_lut ? dpu_panel_cal_load(dpu_kms->panel_lut) :
+				  -ENOMEM;
+	dpu_kms->has_panel_cal = !rc;
+	if (rc && rc != -ENODEV)
+		DPU_ERROR("factory panel calibration unusable: %d\n", rc);
+
 	/*
 	 * _dpu_kms_drm_obj_init should create the DRM related objects
 	 * i.e. CRTCs, planes, encoders, connectors and so forth
@@ -1454,6 +1464,7 @@ static int __maybe_unused dpu_runtime_resume(struct device *dev)
 	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
 	struct drm_encoder *encoder;
 	struct drm_device *ddev;
+	unsigned long core_rate;
 
 	ddev = dpu_kms->dev;
 
@@ -1461,6 +1472,24 @@ static int __maybe_unused dpu_runtime_resume(struct device *dev)
 	if (rc) {
 		DPU_ERROR("clock enable failed rc:%d\n", rc);
 		return rc;
+	}
+
+	/*
+	 * Runtime suspend can drop the power-domain performance state even when
+	 * the clock framework still reports the previously programmed rate.
+	 * Re-assert the current core clock rate so OPP required-opps are restored
+	 * before touching DPU registers.
+	 */
+	core_rate = dpu_kms_get_clk_rate(dpu_kms, "core");
+	if (core_rate) {
+		core_rate = min_t(unsigned long, core_rate, dpu_kms->perf.max_core_clk_rate);
+		rc = dev_pm_opp_set_rate(&dpu_kms->pdev->dev, core_rate);
+		if (rc) {
+			DPU_ERROR("failed to restore core clock rate %lu: %d\n",
+				  core_rate, rc);
+			return rc;
+		}
+		dpu_kms->perf.core_clk_rate = core_rate;
 	}
 
 	dpu_vbif_init_memtypes(dpu_kms);
