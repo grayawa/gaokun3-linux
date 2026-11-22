@@ -17,9 +17,10 @@ say() { printf '\n==> %s\n' "$*" >&2; }
 git rev-parse --is-inside-work-tree >/dev/null || die "Run in a git repository"
 git remote get-url origin >/dev/null || die "Missing origin remote"
 
-# Clone/fetch with blob filtering: source and destination are both large kernels.
+# Fetch full blobs for three tree snapshots; partial clones from different
+# remotes can ask the wrong promisor remote for missing objects.
 say "Fetch destination $DEST_BRANCH"
-git -c protocol.version=2 fetch --no-tags --filter=blob:none --depth=1 origin \
+git -c protocol.version=2 fetch --no-tags --no-filter --depth=1 origin \
   "refs/heads/$DEST_BRANCH:refs/remotes/origin/$DEST_BRANCH"
 DEST_SHA="$(git rev-parse "refs/remotes/origin/$DEST_BRANCH^{commit}")"
 
@@ -27,7 +28,7 @@ if ! git remote get-url gaokun3-bore >/dev/null 2>&1; then
   git remote add gaokun3-bore https://github.com/gaokun3/kernel.git
 fi
 say "Fetch pinned upstream 7.2.15-bore: $UPSTREAM_SHA"
-git -c protocol.version=2 fetch --no-tags --filter=blob:none --depth=1 gaokun3-bore "$UPSTREAM_SHA"
+git -c protocol.version=2 fetch --no-tags --no-filter --depth=1 gaokun3-bore "$UPSTREAM_SHA"
 SOURCE_SHA="$(git rev-parse 'FETCH_HEAD^{commit}')"
 [[ "$SOURCE_SHA" == "$UPSTREAM_SHA" ]] || die "Unexpected source commit"
 
@@ -35,7 +36,7 @@ if ! git remote get-url stable-rolling >/dev/null 2>&1; then
   git remote add stable-rolling https://github.com/gregkh/linux.git
 fi
 say "Fetch clean Linux stable base $STABLE_TAG"
-git -c protocol.version=2 fetch --no-tags --filter=blob:none --depth=1 stable-rolling \
+git -c protocol.version=2 fetch --no-tags --no-filter --depth=1 stable-rolling \
   "refs/tags/$STABLE_TAG:refs/tags/port-base-$STABLE_TAG"
 BASE_SHA="$(git rev-parse "refs/tags/port-base-$STABLE_TAG^{commit}")"
 
